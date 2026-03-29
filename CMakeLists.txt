@@ -7,19 +7,13 @@ project(pico-llm C CXX ASM)
 pico_sdk_init()
 
 # SDIO_RP2350 library (PIO-based 4-bit SDIO)
-# Clone into lib/SDIO_RP2350:
-#   git submodule add https://github.com/rabbitholecomputing/SDIO_RP2350 lib/SDIO_RP2350
-option(USE_SDIO "Enable SDIO_RP2350 SD card driver" OFF)
-
-if(USE_SDIO)
-    add_subdirectory(lib/SDIO_RP2350)
-endif()
+add_subdirectory(lib/SDIO_RP2350)
 
 add_executable(pico_llm
     src/main.c
     src/transformer.c
     src/quantize.c
-    src/sdcard.c
+    src/sdcard.cpp
     src/tokenizer.c
 )
 
@@ -36,16 +30,8 @@ target_compile_definitions(pico_llm PRIVATE
     WEIGHT_BUF_SIZE=32768
 )
 
-# SDIO pin configuration and library linkage
-if(USE_SDIO)
-    target_compile_definitions(pico_llm PRIVATE
-        USE_SDIO_RP2350
-        SDIO_CLK_PIN=10
-        SDIO_CMD_PIN=11
-        SDIO_DAT0_PIN=12
-    )
-    target_include_directories(pico_llm PRIVATE lib/SDIO_RP2350)
-endif()
+# src/ must be on the SDIO library's include path so it finds sdio_rp2350_config.h
+target_include_directories(sdio_rp2350 INTERFACE ${CMAKE_CURRENT_LIST_DIR}/src)
 
 target_compile_options(pico_llm PRIVATE -O2 -Wall -Wextra)
 
@@ -53,12 +39,10 @@ target_link_libraries(pico_llm
     pico_stdlib
     hardware_dma
     hardware_gpio
+    hardware_pio
     pico_multicore
+    sdio_rp2350
 )
-
-if(USE_SDIO)
-    target_link_libraries(pico_llm sdio_rp2350)
-endif()
 
 pico_enable_stdio_uart(pico_llm 1)
 pico_enable_stdio_usb(pico_llm 0)

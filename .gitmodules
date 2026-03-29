@@ -1,0 +1,3 @@
+[submodule "lib/SDIO_RP2350"]
+	path = lib/SDIO_RP2350
+	url = https://github.com/rabbitholecomputing/SDIO_RP2350.git

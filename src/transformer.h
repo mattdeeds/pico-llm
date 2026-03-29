@@ -62,20 +62,29 @@ typedef struct {
     int kv_cache_len;
 } RunState;
 
+// Byte offsets into the model file on SD card
+typedef struct {
+    uint32_t vocab_end;       // end of vocab section = start of layer weights
+    uint32_t layer_bytes;     // size of one layer's weights in bytes
+    uint32_t final_norm_off;  // byte offset to final_norm
+    uint32_t wcls_off;        // byte offset to classifier weights
+    uint32_t emb_off;         // byte offset to token embedding table
+} ModelLayout;
+
+// Forward declaration (defined in sdcard.h)
+struct WeightBuf;
+
 // Top-level context
 typedef struct {
     Config config;
     RunState state;
+    ModelLayout layout;
 
-    // Double-buffer pointers (managed by sdcard module)
-    int8_t *weight_buf_a;
-    int8_t *weight_buf_b;
-    int8_t *active_buf;
+    // Double-buffer for streaming weights from SD
+    struct WeightBuf *wb;
 
-    // Final layer norm + classifier
+    // Final layer norm (small enough to keep in RAM)
     float *final_norm;    // [dim]
-    int8_t *wcls;         // [vocab_size * dim]
-    float wcls_scale;
 } TransformerContext;
 
 // Compile-time RAM budget checks
@@ -88,6 +97,9 @@ _Static_assert(WEIGHT_BUF_SIZE <= 32768,
 void transformer_init(TransformerContext *ctx);
 float *forward(TransformerContext *ctx, int token, int pos);
 int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_tokens);
+
+// Load a single token embedding from SD card into out[dim]
+bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out);
 
 // Math primitives
 void rmsnorm(float *out, const float *x, const float *weight, int size);
