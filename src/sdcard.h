@@ -16,6 +16,11 @@ bool sdcard_init(void);
 // block_addr: 512-byte block number, count: number of blocks
 bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count);
 
+// Write contiguous blocks from buffer to SD card
+// block_addr: 512-byte block number, count: number of blocks
+// buf must be 4-byte aligned
+bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count);
+
 // --- Double-buffer weight streaming ---
 // Manages two weight buffers. Core 1 prefetches into the inactive buffer
 // while Core 0 computes on the active buffer.

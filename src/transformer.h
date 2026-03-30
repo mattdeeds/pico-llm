@@ -69,7 +69,19 @@ typedef struct {
     uint32_t final_norm_off;  // byte offset to final_norm
     uint32_t wcls_off;        // byte offset to classifier weights
     uint32_t emb_off;         // byte offset to token embedding table
+    uint32_t kv_base_block;   // first SD block of KV cache region
 } ModelLayout;
+
+// Cursor for sequentially reading weights from the double-buffered SD stream
+typedef struct {
+    struct WeightBuf *wb;
+    uint32_t sd_off;        // SD byte offset of next byte to consume
+    uint32_t end_sd_off;    // SD byte offset past the end of this stream
+    uint32_t buf_off;       // current read position within buffer
+    uint32_t buf_valid;     // number of valid bytes in buffer
+    int8_t *buf_ptr;        // pointer to current buffer data
+    bool prefetch_pending;  // true if Core 1 has a prefetch in flight
+} WeightStream;
 
 // Forward declaration (defined in sdcard.h)
 struct WeightBuf;
@@ -100,6 +112,21 @@ int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_
 
 // Load a single token embedding from SD card into out[dim]
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out);
+
+// Weight stream functions
+void ws_init(WeightStream *ws, struct WeightBuf *wb, uint32_t sd_byte_offset,
+             uint32_t total_bytes);
+void ws_ensure(WeightStream *ws, uint32_t min_bytes);
+void ws_read_bytes(WeightStream *ws, void *out, uint32_t nbytes);
+void ws_drain(WeightStream *ws);
+void ws_resume(WeightStream *ws);
+
+// Tiled streaming matmul: reads rows*cols int8 weights + scale from stream
+void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
+                     float x_scale, int rows, int cols);
+// Chunked variant for large output (classifier): avoids large VLA
+void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
+                           float x_scale, int rows, int cols);
 
 // Math primitives
 void rmsnorm(float *out, const float *x, const float *weight, int size);

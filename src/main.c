@@ -203,12 +203,18 @@ int main(void) {
     }
     compute_layout(&ctx.layout, &ctx.config);
 
+    // KV cache lives on SD after all model data, block-aligned
+    uint32_t model_end = ctx.layout.emb_off
+                       + (uint32_t)VOCAB_SIZE * D_MODEL * sizeof(float);
+    ctx.layout.kv_base_block = (model_end + 511) / 512;
+
     printf("Model layout (byte offsets on SD):\n");
     printf("  weights start:  %lu\n", (unsigned long)ctx.layout.vocab_end);
     printf("  layer size:     %lu bytes\n", (unsigned long)ctx.layout.layer_bytes);
     printf("  final_norm:     %lu\n", (unsigned long)ctx.layout.final_norm_off);
     printf("  classifier:     %lu\n", (unsigned long)ctx.layout.wcls_off);
     printf("  embeddings:     %lu\n", (unsigned long)ctx.layout.emb_off);
+    printf("  kv_cache:       block %lu\n", (unsigned long)ctx.layout.kv_base_block);
     printf("\n");
 
     // --- Load final norm into RAM (stays resident) ---
@@ -244,17 +250,14 @@ int main(void) {
     printf("  Emb read buf:   %lu bytes\n", (unsigned long)sizeof(emb_read_buf));
     printf("\n");
 
-    printf("pico-llm ready. Model loaded from SD.\n");
+    printf("pico-llm ready. Model loaded from SD.\n\n");
 
-    // TODO: Accept prompt input and run generate()
-    // For now, test: load token 0 embedding
-    printf("Test: loading token 0 embedding...\n");
-    if (load_token_embedding(&ctx, 0, ctx.state.x)) {
-        printf("  x[0]=%.4f x[1]=%.4f x[2]=%.4f\n",
-               ctx.state.x[0], ctx.state.x[1], ctx.state.x[2]);
-    } else {
-        printf("  FAILED\n");
-    }
+    // --- Generate tokens ---
+    // Start with token 0 (BOS) and generate up to 32 tokens
+    printf("Generating (BOS=0, max_tokens=32)...\n");
+    int prompt[] = {0};
+    int n_generated = generate(&ctx, prompt, 1, 32);
+    printf("\nGenerated %d tokens.\n", n_generated);
 
 halt:
     while (1) {

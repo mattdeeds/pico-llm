@@ -25,6 +25,8 @@
 #define CMD16  16  // SET_BLOCKLEN
 #define CMD17  17  // READ_SINGLE_BLOCK
 #define CMD18  18  // READ_MULTIPLE_BLOCK
+#define CMD24  24  // WRITE_BLOCK
+#define CMD25  25  // WRITE_MULTIPLE_BLOCK
 #define CMD55  55  // APP_CMD
 #define ACMD6  6   // SET_BUS_WIDTH
 #define ACMD41 41  // SD_SEND_OP_COND
@@ -167,6 +169,41 @@ bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count) {
     rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
     rp2350_sdio_stop();
 
+    return status == SDIO_OK;
+}
+
+bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count) {
+    uint32_t reply;
+    sdio_status_t status;
+
+    uint32_t address = card_sdhc ? block_addr : (block_addr * 512);
+
+    if (count == 1) {
+        status = rp2350_sdio_command_u32(CMD24, address, &reply, SDIO_FLAG_STOP_CLK);
+        if (status != SDIO_OK) return false;
+
+        status = rp2350_sdio_tx_start(buf, 1, 512);
+        if (status != SDIO_OK) return false;
+
+        do { status = rp2350_sdio_tx_poll(NULL); } while (status == SDIO_BUSY);
+        rp2350_sdio_stop();
+        return status == SDIO_OK;
+    }
+
+    status = rp2350_sdio_command_u32(CMD25, address, &reply, SDIO_FLAG_STOP_CLK);
+    if (status != SDIO_OK) return false;
+
+    status = rp2350_sdio_tx_start(buf, count, 512);
+    if (status != SDIO_OK) {
+        rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+        rp2350_sdio_stop();
+        return false;
+    }
+
+    do { status = rp2350_sdio_tx_poll(NULL); } while (status == SDIO_BUSY);
+
+    rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+    rp2350_sdio_stop();
     return status == SDIO_OK;
 }
 
