@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+build/
+
+# Model binaries
+*.bin
+*.uf2
+
+# KiCad
+*-backups/
+~*.lck
+*.bak
+fabrication-toolkit-options.json
+
+# Python
+__pycache__/
+*.pyc
