@@ -13,6 +13,7 @@ build/
 ~*.lck
 *.bak
 fabrication-toolkit-options.json
+pico-llm-kicad/production/
 
 # Python
 __pycache__/
