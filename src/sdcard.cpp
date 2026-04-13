@@ -48,42 +48,79 @@ bool sdcard_init(void) {
     uint32_t reply;
     sdio_status_t status;
 
+    // Power-cycle the SD card via LDO (GPIO8 = LDO_EN, active high)
+    // In case JP2 bridges VDD to LDO output instead of direct 3.3V
+    gpio_init(8);
+    gpio_set_dir(8, GPIO_OUT);
+    gpio_put(8, 0);          // Force LDO off
+    busy_wait_us_32(250000); // Let caps discharge, card fully power down
+    gpio_put(8, 1);          // LDO on
+    busy_wait_us_32(500000); // Let card power up fully
+
     // Start at 400 kHz for card identification
     rp2350_sdio_init(rp2350_sdio_get_timing(SDIO_INITIALIZE));
+
+    // Enable internal pull-ups on CMD and D0-D3 (pad register, independent of PIO)
+    gpio_pull_up(SDIO_CMD);
+    gpio_pull_up(SDIO_D0);
+    gpio_pull_up(SDIO_D1);
+    gpio_pull_up(SDIO_D2);
+    gpio_pull_up(SDIO_D3);
+
+    // Give card 74+ clock cycles to stabilize after power-up
     busy_wait_us_32(1000);
 
     // CMD0: GO_IDLE_STATE (no response)
     // Retry a few times to establish contact
-    for (int i = 0; i < 5; i++) {
-        busy_wait_us_32(1000);
-        rp2350_sdio_command(CMD0, 0, NULL, 0, SDIO_FLAG_NO_LOGMSG);
-        busy_wait_us_32(1000);
-        status = rp2350_sdio_command_u32(CMD8, 0x1AA, &reply, SDIO_FLAG_NO_LOGMSG);
-        if (status == SDIO_OK && reply == 0x1AA)
+    bool sd_v2 = false;
+    for (int i = 0; i < 10; i++) {
+        busy_wait_us_32(5000);
+        rp2350_sdio_command(CMD0, 0, NULL, 0, 0);
+        busy_wait_us_32(5000);
+        status = rp2350_sdio_command_u32(CMD8, 0x1AA, &reply, 0);
+        if (status == SDIO_OK && reply == 0x1AA) {
+            sd_v2 = true;
             break;
+        }
     }
 
-    if (status != SDIO_OK || reply != 0x1AA) {
-        printf("SDIO: no response to CMD8 (status=%d reply=0x%lx)\n",
-               status, (unsigned long)reply);
-        return false;
+    if (sd_v2) {
+        printf("CMD8 OK (SD v2.0+)\n");
+    } else {
+        printf("CMD8 no response — assuming SD v1.x (status=%d)\n", status);
+        // Re-send CMD0 to ensure card is in idle state
+        rp2350_sdio_command(CMD0, 0, NULL, 0, 0);
+        busy_wait_us_32(5000);
     }
 
-    // ACMD41: wait for card initialization (up to 1 second)
-    absolute_time_t deadline = make_timeout_time_ms(1000);
-    uint32_t ocr_arg = (1 << 30) | (1 << 28) | (1 << 20); // HCS + max perf + 3.3V
+    // ACMD41: wait for card initialization (up to 2 seconds)
+    // SD v2.0+: set HCS (host supports SDHC); SD v1.x: no HCS
+    absolute_time_t deadline = make_timeout_time_ms(2000);
+    // Use the SDIO library's recommended OCR mode:
+    // HCS (bit 30) + XPC max perf (bit 28) + 3.3V (bit 20)
+    uint32_t ocr_arg = (sd_v2 ? ((1 << 30) | (1 << 28)) : 0) | (1 << 20);
+    printf("ACMD41 arg: 0x%08lx\n", (unsigned long)ocr_arg);
+    int acmd41_tries = 0;
     do {
         status = sd_cmd(CMD55, 0, &reply);
         if (status != SDIO_OK) { printf("SDIO: CMD55 fail\n"); return false; }
         status = sd_cmd_no_crc(ACMD41, ocr_arg, &card_ocr);
-        if (status != SDIO_OK) { printf("SDIO: ACMD41 fail\n"); return false; }
+        if (status != SDIO_OK) { printf("SDIO: ACMD41 fail (status=%d)\n", status); return false; }
+        acmd41_tries++;
+        if (acmd41_tries <= 3 || (card_ocr & (1 << 31))) {
+            printf("  #%d: CMD55_R1=0x%08lx OCR=0x%08lx\n",
+                   acmd41_tries, (unsigned long)reply, (unsigned long)card_ocr);
+        }
+        busy_wait_us_32(10000); // 10ms between polls
         if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            printf("SDIO: ACMD41 timeout\n");
+            printf("ACMD41: timeout after %d tries (OCR=0x%08lx)\n",
+                   acmd41_tries, (unsigned long)card_ocr);
             return false;
         }
     } while (!(card_ocr & (1 << 31)));
 
-    card_sdhc = (card_ocr & (1 << 30)) != 0;
+    // SD v2 with HCS → assume SDHC; SD v1.x → SDSC (byte addressing)
+    card_sdhc = sd_v2;
 
     // CMD2: ALL_SEND_CID (136-bit response, we don't need the content)
     uint8_t cid[16];

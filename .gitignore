@@ -15,6 +15,9 @@ build/
 fabrication-toolkit-options.json
 pico-llm-kicad/production/
 
+# Trained models and checkpoints
+models/
+
 # Python
 __pycache__/
 *.pyc

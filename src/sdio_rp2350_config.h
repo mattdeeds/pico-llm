@@ -6,6 +6,14 @@
 // Disable SdFat integration (we use our own adapter in sdcard.c)
 #define SDIO_USE_SDFAT 0
 
+// Enable error logging only (debug is too verbose for normal operation)
+#include <stdio.h>
+static inline void sdio_log(const char *txt, uint32_t arg1, uint32_t arg2) {
+    printf("SDIO: %s (%lu, %lu)\n", txt, (unsigned long)arg1, (unsigned long)arg2);
+}
+#define SDIO_CRITMSG(txt, arg1, arg2) sdio_log(txt, arg1, arg2)
+#define SDIO_ERRMSG(txt, arg1, arg2) sdio_log(txt, arg1, arg2)
+
 // PIO block and state machine
 #define SDIO_PIO pio1
 #define SDIO_SM  0

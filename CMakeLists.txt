@@ -31,12 +31,14 @@ target_compile_definitions(pico_llm PRIVATE
 )
 
 # src/ must be on the SDIO library's include path so it finds sdio_rp2350_config.h
-target_include_directories(sdio_rp2350 INTERFACE ${CMAKE_CURRENT_LIST_DIR}/src)
+# PRIVATE so the library itself sees the config during compilation (not just consumers)
+target_include_directories(sdio_rp2350 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 
 target_compile_options(pico_llm PRIVATE -O2 -Wall -Wextra)
 
 target_link_libraries(pico_llm
     pico_stdlib
+    pico_stdio_usb
     hardware_dma
     hardware_gpio
     hardware_pio
@@ -44,7 +46,7 @@ target_link_libraries(pico_llm
     sdio_rp2350
 )
 
-pico_enable_stdio_uart(pico_llm 1)
-pico_enable_stdio_usb(pico_llm 0)
+pico_enable_stdio_uart(pico_llm 0)
+pico_enable_stdio_usb(pico_llm 1)
 
 pico_add_extra_outputs(pico_llm)

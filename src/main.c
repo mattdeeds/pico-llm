@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"
 #include "pico/multicore.h"
 #include "transformer.h"
 #include "sdcard.h"
@@ -159,6 +160,12 @@ bool load_token_embedding(const TransformerContext *ctx, int token_id, float *ou
 
 int main(void) {
     stdio_init_all();
+
+    // Wait for USB CDC to enumerate so we don't lose boot output
+    while (!stdio_usb_connected()) {
+        sleep_ms(100);
+    }
+    sleep_ms(200);
 
     printf("\n");
     printf("=========================\n");
