@@ -21,28 +21,31 @@ bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count);
 // buf must be 4-byte aligned
 bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count);
 
-// --- Double-buffer weight streaming ---
-// Manages two weight buffers. Core 1 prefetches into the inactive buffer
-// while Core 0 computes on the active buffer.
+// --- Double-buffer weight streaming with async DMA ---
+// Core 0 fills the prefetch buffer via async DMA.
+// Core 1 computes matmul on the active buffer.
+// Overlap: DMA and compute run concurrently on different buffers.
 
 typedef struct WeightBuf {
     int8_t *buf_a;
     int8_t *buf_b;
-    int8_t *active;       // buffer Core 0 is computing on
-    int8_t *prefetch;     // buffer Core 1 is filling
+    int8_t *active;       // buffer being consumed
+    int8_t *prefetch;     // buffer being filled by async DMA
     uint32_t buf_size;    // size of each buffer in bytes
+    bool dma_pending;     // true if async DMA is in flight
 } WeightBuf;
 
 void weightbuf_init(WeightBuf *wb, int8_t *buf_a, int8_t *buf_b, uint32_t buf_size);
 
-// Request Core 1 to prefetch 'size' bytes starting at SD byte offset
+// Start async DMA read of 'size' bytes from SD into the prefetch buffer.
+// Returns immediately — DMA IRQ handler on Core 0 chains blocks.
 void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t size);
 
-// Block until prefetch is done, swap buffers, return pointer to the filled data
+// Block until async DMA is done, then swap buffers and return the filled data.
 int8_t *weightbuf_get(WeightBuf *wb);
 
-// Core 1 prefetch worker entry point
-void prefetch_worker(void);
+// Core 1 compute worker entry point (runs matmul_q8_tile on demand)
+void compute_worker(void);
 
 #ifdef __cplusplus
 }

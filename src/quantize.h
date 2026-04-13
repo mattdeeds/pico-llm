@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Quantized matmul: out[rows] = (weights[rows][cols] @ x[cols]) * scale
 // Weights are int8, input is float (quantized internally), output is float
 void matmul_q8(float *out, const int8_t *weights, float w_scale,
@@ -20,5 +24,9 @@ float quantize_vec(int8_t *out, const float *in, int size);
 // Dequantize int32 accumulators to float with combined scale
 void dequant_acc(float *out, const int32_t *acc, float w_scale, float x_scale,
                  int size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

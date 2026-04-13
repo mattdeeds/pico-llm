@@ -2,10 +2,23 @@
 #include "sdcard.h"
 #include "quantize.h"
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+// Shared state for Core 1 compute worker (defined in sdcard.cpp)
+typedef struct {
+    const int8_t *x_q;
+    int32_t *acc;
+    int cols;
+    int rows_done;
+} ComputeState;
+extern ComputeState g_compute;
+
+// Shared matmul accumulator (defined in main.c)
+extern int32_t matmul_acc[];
 
 // ============================================================================
 // Math primitives
@@ -216,37 +229,59 @@ void ws_resume(WeightStream *ws) {
 
 void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols) {
-    // Stack accumulator — max 704*4 = 2816 bytes for hidden_dim
-    int32_t acc[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
     int8_t row_tmp[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
 
-    int rows_done = 0;
-    while (rows_done < rows) {
+    // Set up shared state for Core 1 compute worker
+    g_compute.x_q = x_q;
+    g_compute.acc = matmul_acc;
+    g_compute.cols = cols;
+    g_compute.rows_done = 0;
+
+    int rows_sent = 0;
+    bool core1_busy = false;
+
+    while (rows_sent < rows) {
+        // Sync with Core 1 before loading a new buffer (prevents overwriting
+        // the buffer Core 1 is reading when ws_ensure swaps + starts prefetch)
+        if (core1_busy) {
+            multicore_fifo_pop_blocking();
+            core1_busy = false;
+        }
+
         ws_ensure(ws, 1);
         uint32_t avail = ws->buf_valid - ws->buf_off;
         int tile_rows = avail / cols;
-        if (tile_rows > rows - rows_done) tile_rows = rows - rows_done;
+        if (tile_rows > rows - rows_sent) tile_rows = rows - rows_sent;
 
         if (tile_rows > 0) {
-            matmul_q8_tile(acc + rows_done,
-                           (const int8_t *)ws->buf_ptr + ws->buf_off,
-                           x_q, tile_rows, cols);
+            // Dispatch tile to Core 1
+            multicore_fifo_push_blocking((uint32_t)(ws->buf_ptr + ws->buf_off));
+            multicore_fifo_push_blocking((uint32_t)tile_rows);
+            core1_busy = true;
+
             ws->buf_off += tile_rows * cols;
             ws->sd_off += tile_rows * cols;
-            rows_done += tile_rows;
+            rows_sent += tile_rows;
+            // Core 1 computes while Core 0 loops to load next buffer (async DMA)
         } else {
-            // Row spans buffer boundary — read into scratch and process
+            // Row spans buffer boundary — handle on Core 0
             ws_read_bytes(ws, row_tmp, cols);
-            matmul_q8_tile(acc + rows_done, row_tmp, x_q, 1, cols);
-            rows_done++;
+            matmul_q8_tile(matmul_acc + g_compute.rows_done,
+                           row_tmp, x_q, 1, cols);
+            g_compute.rows_done++;
+            rows_sent++;
         }
+    }
+
+    if (core1_busy) {
+        multicore_fifo_pop_blocking();
     }
 
     // Read the float32 scale that follows the int8 weight data
     float w_scale;
     ws_read_bytes(ws, &w_scale, sizeof(float));
 
-    dequant_acc(out, acc, w_scale, x_scale, rows);
+    dequant_acc(out, matmul_acc, w_scale, x_scale, rows);
 }
 
 // Chunked variant for large output dimensions (classifier: vocab_size rows).
@@ -255,39 +290,58 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
 
 void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
                            float x_scale, int rows, int cols) {
-    int32_t acc[CHUNK_ROWS];
     int8_t row_tmp[D_MODEL];
+
+    // Use shared accumulator for each chunk
+    g_compute.x_q = x_q;
+    g_compute.cols = cols;
 
     int rows_done = 0;
     while (rows_done < rows) {
         int chunk = rows - rows_done;
         if (chunk > CHUNK_ROWS) chunk = CHUNK_ROWS;
 
-        int chunk_done = 0;
-        while (chunk_done < chunk) {
+        g_compute.acc = matmul_acc;
+        g_compute.rows_done = 0;
+
+        int chunk_sent = 0;
+        bool core1_busy = false;
+
+        while (chunk_sent < chunk) {
+            if (core1_busy) {
+                multicore_fifo_pop_blocking();
+                core1_busy = false;
+            }
+
             ws_ensure(ws, 1);
             uint32_t avail = ws->buf_valid - ws->buf_off;
             int tile = avail / cols;
-            if (tile > chunk - chunk_done) tile = chunk - chunk_done;
+            if (tile > chunk - chunk_sent) tile = chunk - chunk_sent;
 
             if (tile > 0) {
-                matmul_q8_tile(acc + chunk_done,
-                               (const int8_t *)ws->buf_ptr + ws->buf_off,
-                               x_q, tile, cols);
+                multicore_fifo_push_blocking((uint32_t)(ws->buf_ptr + ws->buf_off));
+                multicore_fifo_push_blocking((uint32_t)tile);
+                core1_busy = true;
+
                 ws->buf_off += tile * cols;
                 ws->sd_off += tile * cols;
-                chunk_done += tile;
+                chunk_sent += tile;
             } else {
-                // Row spans buffer boundary — read into scratch and process
                 ws_read_bytes(ws, row_tmp, cols);
-                matmul_q8_tile(acc + chunk_done, row_tmp, x_q, 1, cols);
-                chunk_done++;
+                matmul_q8_tile(matmul_acc + g_compute.rows_done,
+                               row_tmp, x_q, 1, cols);
+                g_compute.rows_done++;
+                chunk_sent++;
             }
+        }
+
+        if (core1_busy) {
+            multicore_fifo_pop_blocking();
         }
 
         // Store as float with scale=1 (corrected after reading the real scale)
         for (int i = 0; i < chunk; i++) {
-            out[rows_done + i] = (float)acc[i];
+            out[rows_done + i] = (float)matmul_acc[i];
         }
         rows_done += chunk;
     }

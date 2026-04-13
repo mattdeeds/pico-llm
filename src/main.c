@@ -27,6 +27,9 @@ static float logits_buf[VOCAB_SIZE];
 // Final layer norm stays in RAM (dim * 4 bytes = 1024 bytes for dim=256)
 static float final_norm_buf[D_MODEL];
 
+// Shared matmul accumulator for Core 1 compute (max 704 rows × 4 bytes = 2816 bytes)
+int32_t matmul_acc[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
+
 // Scratch buffer for SD reads during init (reuses weight_buf_a before prefetch starts)
 #define SCRATCH_BUF ((uint8_t *)weight_buf_a)
 #define SCRATCH_SIZE WEIGHT_BUF_SIZE
@@ -237,13 +240,14 @@ int main(void) {
     // --- Initialize run state ---
     init_run_state(&ctx.state);
 
-    // --- Initialize weight buffers (single-core synchronous mode) ---
-    // TODO: Core 1 SDIO prefetch causes CMD18 hang — PIO commands from Core 1
-    // don't return. Future options: single-core async DMA, or Core 1 for compute.
+    // --- Initialize weight buffers and Core 1 compute worker ---
+    // Core 0: all SD card reads (async DMA, IRQ handler chains blocks)
+    // Core 1: matmul compute (dispatched via multicore FIFO)
     static WeightBuf wb;
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
-    printf("Weight streaming ready (single-core mode).\n\n");
+    multicore_launch_core1(compute_worker);
+    printf("Weight streaming ready (dual-core: Core 0 IO, Core 1 compute).\n\n");
 
     // --- Print RAM usage ---
     printf("RAM usage:\n");

@@ -288,20 +288,12 @@ bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count
 }
 
 // ============================================================================
-// Double-buffer weight streaming
+// Double-buffer weight streaming with async DMA
 //
-// Core 0 computes on the "active" buffer.
-// Core 1 fills the "prefetch" buffer from SD in the background.
-// When Core 0 calls weightbuf_get(), it blocks until prefetch is done,
-// then swaps the buffers.
-//
-// Communication uses the RP2350 multicore FIFO:
-//   Core 0 -> Core 1: FIFO push signals "start prefetch"
-//   Core 1 -> Core 0: FIFO push signals "prefetch done"
+// Core 0 starts SD card DMA transfers (async via IRQ handler).
+// Core 1 runs matmul compute on the active buffer.
+// Overlap: DMA fills the prefetch buffer while Core 1 computes on the active one.
 // ============================================================================
-
-// Shared state between cores (only written by one core at a time)
-static WeightBuf *shared_wb;
 
 void weightbuf_init(WeightBuf *wb, int8_t *buf_a, int8_t *buf_b, uint32_t buf_size) {
     wb->buf_a = buf_a;
@@ -309,7 +301,7 @@ void weightbuf_init(WeightBuf *wb, int8_t *buf_a, int8_t *buf_b, uint32_t buf_si
     wb->active = buf_a;
     wb->prefetch = buf_b;
     wb->buf_size = buf_size;
-    shared_wb = wb;
+    wb->dma_pending = false;
 }
 
 void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t size) {
@@ -319,84 +311,87 @@ void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t s
     uint32_t max_blocks = wb->buf_size / 512;
     if (block_count > max_blocks) block_count = max_blocks;
 
-    // Synchronous read on Core 0 (Core 1 SDIO access hangs on CMD18 —
-    // PIO state machines don't reliably handle commands from Core 1)
-    bool ok = sdcard_read_blocks(block, (uint8_t *)wb->prefetch, block_count);
-    if (!ok) {
-        printf("weightbuf prefetch failed at block %lu\n", (unsigned long)block);
+    // Start async DMA transfer — returns immediately.
+    // DMA IRQ handler on Core 0 chains blocks automatically.
+    uint32_t address = card_sdhc ? block : (block * 512);
+    uint32_t reply;
+
+    sdio_status_t status = rp2350_sdio_command_u32(CMD18, address, &reply,
+                                                    SDIO_FLAG_STOP_CLK);
+    if (status != SDIO_OK) {
+        printf("prefetch CMD18 fail at block %lu (status=%d)\n",
+               (unsigned long)block, status);
+        wb->dma_pending = false;
+        return;
     }
+
+    status = rp2350_sdio_rx_start((uint8_t *)wb->prefetch, block_count, 512);
+    if (status != SDIO_OK) {
+        printf("prefetch rx_start fail (status=%d)\n", status);
+        rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+        rp2350_sdio_stop();
+        wb->dma_pending = false;
+        return;
+    }
+
+    wb->dma_pending = true;
 }
 
 int8_t *weightbuf_get(WeightBuf *wb) {
-    // Swap active and prefetch buffers
-    int8_t *filled = wb->prefetch;
-    wb->prefetch = wb->active;
-    wb->active = filled;
-
-    return filled;
-}
-
-// Read blocks from SD card with manual DMA polling (for Core 1).
-// The DMA IRQ handler is registered on Core 0 only, so Core 1
-// must poll for DMA completion manually.
-static bool sdcard_read_blocks_polled(uint32_t block_addr, uint8_t *buf, uint32_t count) {
-    uint32_t reply;
-    sdio_status_t status;
-
-    uint32_t address = card_sdhc ? block_addr : (block_addr * 512);
-
-    if (count == 1) {
-        status = rp2350_sdio_command_u32(CMD17, address, &reply, SDIO_FLAG_STOP_CLK);
-        if (status != SDIO_OK) return false;
-
-        status = rp2350_sdio_rx_start(buf, 1, 512);
-        if (status != SDIO_OK) return false;
-
+    if (wb->dma_pending) {
+        // Poll until async DMA completes
+        sdio_status_t status;
         do {
             rp2350_sdio_poll_dma();
             status = rp2350_sdio_rx_poll(NULL);
         } while (status == SDIO_BUSY);
-        rp2350_sdio_stop();
-        return status == SDIO_OK;
-    }
 
-    status = rp2350_sdio_command_u32(CMD18, address, &reply, SDIO_FLAG_STOP_CLK);
-    if (status != SDIO_OK) return false;
-
-    status = rp2350_sdio_rx_start(buf, count, 512);
-    if (status != SDIO_OK) {
+        uint32_t reply;
         rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
         rp2350_sdio_stop();
-        return false;
+        wb->dma_pending = false;
+
+        if (status != SDIO_OK) {
+            printf("weightbuf_get: DMA error %d\n", status);
+        }
     }
 
-    do {
-        rp2350_sdio_poll_dma();
-        status = rp2350_sdio_rx_poll(NULL);
-    } while (status == SDIO_BUSY);
-
-    rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
-    rp2350_sdio_stop();
-
-    return status == SDIO_OK;
+    // Swap active and prefetch buffers
+    int8_t *filled = wb->prefetch;
+    wb->prefetch = wb->active;
+    wb->active = filled;
+    return filled;
 }
 
-void prefetch_worker(void) {
-    WeightBuf *wb = shared_wb;
+// ============================================================================
+// Core 1 compute worker
+//
+// Runs matmul_q8_tile on demand. Core 0 sends (weights_ptr, n_rows) via FIFO.
+// Core 1 accumulates into the shared accumulator, then signals done.
+// ============================================================================
 
+#include "quantize.h"
+
+// Shared state — set by Core 0 before dispatching chunks
+typedef struct {
+    const int8_t *x_q;   // quantized input vector
+    int32_t *acc;         // accumulator array
+    int cols;             // matmul column count
+    int rows_done;        // rows accumulated so far
+} ComputeState;
+
+ComputeState g_compute;
+
+void compute_worker(void) {
     while (1) {
-        // Wait for Core 0 to send a prefetch request
-        uint32_t block_addr = multicore_fifo_pop_blocking();
-        uint32_t block_count = multicore_fifo_pop_blocking();
+        uint32_t weights_ptr = multicore_fifo_pop_blocking();
+        uint32_t n_rows = multicore_fifo_pop_blocking();
 
-        // Read from SD card with manual DMA polling (no IRQ on this core)
-        bool ok = sdcard_read_blocks_polled(block_addr, (uint8_t *)wb->prefetch, block_count);
-        if (!ok) {
-            printf("prefetch_worker: read failed at block %lu\n",
-                   (unsigned long)block_addr);
-        }
+        matmul_q8_tile(g_compute.acc + g_compute.rows_done,
+                       (const int8_t *)weights_ptr,
+                       g_compute.x_q, (int)n_rows, g_compute.cols);
+        g_compute.rows_done += (int)n_rows;
 
-        // Signal Core 0 that data is ready
         multicore_fifo_push_blocking(1);
     }
 }
