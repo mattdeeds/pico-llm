@@ -3,6 +3,7 @@
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "pico/multicore.h"
+#include "hardware/dma.h"
 #include "transformer.h"
 #include "sdcard.h"
 #include "tokenizer.h"
@@ -236,12 +237,11 @@ int main(void) {
     // --- Initialize run state ---
     init_run_state(&ctx.state);
 
-    // --- Start double-buffer prefetch on Core 1 ---
+    // --- Initialize weight buffers (single-core synchronous mode) ---
     static WeightBuf wb;
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
-    multicore_launch_core1(prefetch_worker);
-    printf("Core 1 prefetch worker started.\n\n");
+    printf("Weight streaming ready (single-core mode).\n\n");
 
     // --- Print RAM usage ---
     printf("RAM usage:\n");

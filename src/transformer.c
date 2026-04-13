@@ -1,6 +1,7 @@
 #include "transformer.h"
 #include "sdcard.h"
 #include "quantize.h"
+#include "pico/stdlib.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -492,14 +493,28 @@ int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_
     int tokens_generated = 0;
 
     for (pos = 0; pos < n_prompt + max_tokens; pos++) {
+        absolute_time_t t0 = get_absolute_time();
         float *logits = forward(ctx, token, pos);
-        if (!logits) break;
+        int64_t elapsed_ms = absolute_time_diff_us(t0, get_absolute_time()) / 1000;
+
+        if (!logits) {
+            printf("[forward returned NULL at pos %d]\n", pos);
+            break;
+        }
 
         if (pos < n_prompt - 1) {
             token = prompt_tokens[pos + 1];
         } else {
             token = argmax(logits, ctx->config.vocab_size);
             tokens_generated++;
+            if (tokens_generated <= 3) {
+                // Print first few logits for diagnostics
+                printf("\n  logits[0..4]: %.3f %.3f %.3f %.3f %.3f\n",
+                       logits[0], logits[1], logits[2], logits[3], logits[4]);
+                printf("  logits[8188..8191]: %.3f %.3f %.3f %.3f\n",
+                       logits[8188], logits[8189], logits[8190], logits[8191]);
+            }
+            printf("[tok %d = %d, %lld ms] ", tokens_generated, token, (long long)elapsed_ms);
         }
     }
 

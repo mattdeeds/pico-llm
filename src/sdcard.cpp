@@ -22,6 +22,7 @@
 #define CMD7   7   // SELECT/DESELECT_CARD
 #define CMD8   8   // SEND_IF_COND
 #define CMD12  12  // STOP_TRANSMISSION
+#define CMD13  13  // SEND_STATUS
 #define CMD16  16  // SET_BLOCKLEN
 #define CMD17  17  // READ_SINGLE_BLOCK
 #define CMD18  18  // READ_MULTIPLE_BLOCK
@@ -141,23 +142,9 @@ bool sdcard_init(void) {
     status = sd_cmd(ACMD6, 2, &reply);
     if (status != SDIO_OK) { printf("SDIO: ACMD6 fail\n"); return false; }
 
-    // Switch to high-speed 50 MHz
-    // CMD6: SWITCH_FUNC — select SDR25 (function group 1 = 1)
-    rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(SDIO_HIGHSPEED);
-    if (hs_timing.use_high_speed) {
-        uint8_t switch_status[64] __attribute__((aligned(4)));
-        // Set block length for the 64-byte switch status
-        sd_cmd(CMD16, 64, &reply);
-        status = rp2350_sdio_command_u32(CMD6, 0x80FFFF01, &reply, SDIO_FLAG_STOP_CLK);
-        if (status == SDIO_OK) {
-            rp2350_sdio_rx_start(switch_status, 1, 64);
-            sdio_status_t rx;
-            do { rx = rp2350_sdio_rx_poll(NULL); } while (rx == SDIO_BUSY);
-            rp2350_sdio_stop();
-        }
-    }
-
-    // Apply high-speed clock
+    // Use standard speed for now (skip high-speed CMD6 switch)
+    // TODO: re-enable high-speed once signal integrity is confirmed
+    rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(SDIO_STANDARD);
     rp2350_sdio_init(hs_timing);
 
     // Set block length to 512 for data transfers
@@ -184,29 +171,55 @@ bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count) {
         status = rp2350_sdio_rx_start(buf, 1, 512);
         if (status != SDIO_OK) return false;
 
-        do { status = rp2350_sdio_rx_poll(NULL); } while (status == SDIO_BUSY);
+        do {
+            rp2350_sdio_poll_dma();
+            status = rp2350_sdio_rx_poll(NULL);
+        } while (status == SDIO_BUSY);
         rp2350_sdio_stop();
         return status == SDIO_OK;
     }
 
-    // Multi-block read
-    status = rp2350_sdio_command_u32(CMD18, address, &reply, SDIO_FLAG_STOP_CLK);
-    if (status != SDIO_OK) return false;
+    // Multi-block read with retries
+    for (int retry = 0; retry < 3; retry++) {
+        if (retry > 0) {
+            rp2350_sdio_stop();
+            busy_wait_us_32(1000);
+        }
 
-    status = rp2350_sdio_rx_start(buf, count, 512);
-    if (status != SDIO_OK) {
+        status = rp2350_sdio_command_u32(CMD18, address, &reply, SDIO_FLAG_STOP_CLK);
+        if (status != SDIO_OK) continue;
+
+        status = rp2350_sdio_rx_start(buf, count, 512);
+        if (status != SDIO_OK) {
+            rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+            continue;
+        }
+
+        do {
+            rp2350_sdio_poll_dma();
+            status = rp2350_sdio_rx_poll(NULL);
+        } while (status == SDIO_BUSY);
+
+        // CMD12: STOP_TRANSMISSION
         rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
         rp2350_sdio_stop();
-        return false;
+
+        if (status == SDIO_OK) return true;
     }
 
-    do { status = rp2350_sdio_rx_poll(NULL); } while (status == SDIO_BUSY);
+    return false;
+}
 
-    // CMD12: STOP_TRANSMISSION
-    rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
-    rp2350_sdio_stop();
-
-    return status == SDIO_OK;
+// Wait for the card to leave programming state after a write.
+// Polls CMD13 (SEND_STATUS) until READY_FOR_DATA is set.
+static void wait_card_ready(void) {
+    uint32_t status_reg;
+    for (int i = 0; i < 1000; i++) {
+        sdio_status_t s = sd_cmd(CMD13, card_rca, &status_reg);
+        if (s == SDIO_OK && (status_reg & (1 << 8))) // READY_FOR_DATA
+            return;
+        busy_wait_us_32(100);
+    }
 }
 
 bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count) {
@@ -222,8 +235,12 @@ bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count
         status = rp2350_sdio_tx_start(buf, 1, 512);
         if (status != SDIO_OK) return false;
 
-        do { status = rp2350_sdio_tx_poll(NULL); } while (status == SDIO_BUSY);
+        do {
+            rp2350_sdio_poll_dma();
+            status = rp2350_sdio_tx_poll(NULL);
+        } while (status == SDIO_BUSY);
         rp2350_sdio_stop();
+        if (status == SDIO_OK) wait_card_ready();
         return status == SDIO_OK;
     }
 
@@ -237,10 +254,14 @@ bool sdcard_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count
         return false;
     }
 
-    do { status = rp2350_sdio_tx_poll(NULL); } while (status == SDIO_BUSY);
+    do {
+        rp2350_sdio_poll_dma();
+        status = rp2350_sdio_tx_poll(NULL);
+    } while (status == SDIO_BUSY);
 
     rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
     rp2350_sdio_stop();
+    if (status == SDIO_OK) wait_card_ready();
     return status == SDIO_OK;
 }
 
@@ -269,25 +290,69 @@ void weightbuf_init(WeightBuf *wb, int8_t *buf_a, int8_t *buf_b, uint32_t buf_si
     shared_wb = wb;
 }
 
-void weightbuf_start_prefetch(WeightBuf *, uint32_t sd_byte_offset, uint32_t size) {
+void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t size) {
+    // Synchronous read on Core 0 (no double-buffering)
     uint32_t block = sd_byte_offset / 512;
-    // Account for sub-block offset when computing how many blocks to read
     uint32_t block_count = (sd_byte_offset % 512 + size + 511) / 512;
 
-    multicore_fifo_push_blocking(block);
-    multicore_fifo_push_blocking(block_count);
+    bool ok = sdcard_read_blocks(block, (uint8_t *)wb->prefetch, block_count);
+    if (!ok) {
+        printf("weightbuf prefetch failed at block %lu\n", (unsigned long)block);
+    }
 }
 
 int8_t *weightbuf_get(WeightBuf *wb) {
-    // Wait for Core 1 to signal completion
-    multicore_fifo_pop_blocking();
-
     // Swap active and prefetch buffers
     int8_t *filled = wb->prefetch;
     wb->prefetch = wb->active;
     wb->active = filled;
 
     return filled;
+}
+
+// Read blocks from SD card with manual DMA polling (for Core 1).
+// The DMA IRQ handler is registered on Core 0 only, so Core 1
+// must poll for DMA completion manually.
+static bool sdcard_read_blocks_polled(uint32_t block_addr, uint8_t *buf, uint32_t count) {
+    uint32_t reply;
+    sdio_status_t status;
+
+    uint32_t address = card_sdhc ? block_addr : (block_addr * 512);
+
+    if (count == 1) {
+        status = rp2350_sdio_command_u32(CMD17, address, &reply, SDIO_FLAG_STOP_CLK);
+        if (status != SDIO_OK) return false;
+
+        status = rp2350_sdio_rx_start(buf, 1, 512);
+        if (status != SDIO_OK) return false;
+
+        do {
+            rp2350_sdio_poll_dma();
+            status = rp2350_sdio_rx_poll(NULL);
+        } while (status == SDIO_BUSY);
+        rp2350_sdio_stop();
+        return status == SDIO_OK;
+    }
+
+    status = rp2350_sdio_command_u32(CMD18, address, &reply, SDIO_FLAG_STOP_CLK);
+    if (status != SDIO_OK) return false;
+
+    status = rp2350_sdio_rx_start(buf, count, 512);
+    if (status != SDIO_OK) {
+        rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+        rp2350_sdio_stop();
+        return false;
+    }
+
+    do {
+        rp2350_sdio_poll_dma();
+        status = rp2350_sdio_rx_poll(NULL);
+    } while (status == SDIO_BUSY);
+
+    rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
+    rp2350_sdio_stop();
+
+    return status == SDIO_OK;
 }
 
 void prefetch_worker(void) {
@@ -298,8 +363,8 @@ void prefetch_worker(void) {
         uint32_t block_addr = multicore_fifo_pop_blocking();
         uint32_t block_count = multicore_fifo_pop_blocking();
 
-        // Read from SD card into the prefetch buffer
-        bool ok = sdcard_read_blocks(block_addr, (uint8_t *)wb->prefetch, block_count);
+        // Read from SD card with manual DMA polling (no IRQ on this core)
+        bool ok = sdcard_read_blocks_polled(block_addr, (uint8_t *)wb->prefetch, block_count);
         if (!ok) {
             printf("prefetch_worker: read failed at block %lu\n",
                    (unsigned long)block_addr);
