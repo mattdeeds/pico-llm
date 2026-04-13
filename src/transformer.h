@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "tokenizer.h"
 
 // Model configuration, read from the weight file header
 typedef struct {
@@ -108,7 +109,8 @@ _Static_assert(WEIGHT_BUF_SIZE <= 32768,
 // Core inference functions
 void transformer_init(TransformerContext *ctx);
 float *forward(TransformerContext *ctx, int token, int pos);
-int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_tokens);
+int generate(TransformerContext *ctx, const Tokenizer *tok,
+             int *prompt_tokens, int n_prompt, int max_tokens);
 
 // Load a single token embedding from SD card into out[dim]
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out);

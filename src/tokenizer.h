@@ -11,6 +11,6 @@ typedef struct {
 void tokenizer_init(Tokenizer *t, uint8_t *vocab_data, int vocab_size);
 void tokenizer_free(Tokenizer *t);
 int tokenizer_encode(Tokenizer *t, const char *text, int *tokens, int max_tokens);
-const char *tokenizer_decode(Tokenizer *t, int token);
+const char *tokenizer_decode(const Tokenizer *t, int token);
 
 #endif

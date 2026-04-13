@@ -37,7 +37,7 @@ int tokenizer_encode(Tokenizer *t, const char *text, int *tokens, int max_tokens
     return 0;
 }
 
-const char *tokenizer_decode(Tokenizer *t, int token) {
+const char *tokenizer_decode(const Tokenizer *t, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
     return t->vocab[token];
 }

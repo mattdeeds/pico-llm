@@ -568,15 +568,38 @@ static int argmax(const float *v, int n) {
     return max_i;
 }
 
-int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_tokens) {
+// Print a BPE token, decoding byte-level encoding.
+// HuggingFace byte-level BPE maps non-printable bytes to U+0100-U+01FF,
+// which appear as 2-byte UTF-8 sequences (0xC4 xx or 0xC5 xx).
+// Common: Ġ (0xC4 0xA0) = space, Ċ (0xC4 0x8A) = newline.
+static void print_token(const char *s) {
+    while (*s) {
+        uint8_t c = (uint8_t)*s;
+        if (c == 0xC4 && ((uint8_t)s[1] & 0xC0) == 0x80) {
+            // U+0100..U+013F → original byte 0x00..0x3F
+            putchar((uint8_t)s[1] - 0x80);
+            s += 2;
+        } else if (c == 0xC5 && ((uint8_t)s[1] & 0xC0) == 0x80) {
+            // U+0140..U+017F → original byte 0x40..0x7F
+            putchar((uint8_t)s[1] - 0x80 + 0x40);
+            s += 2;
+        } else {
+            putchar(c);
+            s++;
+        }
+    }
+}
+
+int generate(TransformerContext *ctx, const Tokenizer *tok,
+             int *prompt_tokens, int n_prompt, int max_tokens) {
     int token = prompt_tokens[0];
     int pos = 0;
     int tokens_generated = 0;
 
+    absolute_time_t gen_start = get_absolute_time();
+
     for (pos = 0; pos < n_prompt + max_tokens; pos++) {
-        absolute_time_t t0 = get_absolute_time();
         float *logits = forward(ctx, token, pos);
-        int64_t elapsed_ms = absolute_time_diff_us(t0, get_absolute_time()) / 1000;
 
         if (!logits) {
             printf("[forward returned NULL at pos %d]\n", pos);
@@ -588,16 +611,14 @@ int generate(TransformerContext *ctx, int *prompt_tokens, int n_prompt, int max_
         } else {
             token = argmax(logits, ctx->config.vocab_size);
             tokens_generated++;
-            if (tokens_generated <= 3) {
-                // Print first few logits for diagnostics
-                printf("\n  logits[0..4]: %.3f %.3f %.3f %.3f %.3f\n",
-                       logits[0], logits[1], logits[2], logits[3], logits[4]);
-                printf("  logits[8188..8191]: %.3f %.3f %.3f %.3f\n",
-                       logits[8188], logits[8189], logits[8190], logits[8191]);
-            }
-            printf("[tok %d = %d, %lld ms] ", tokens_generated, token, (long long)elapsed_ms);
+            print_token(tokenizer_decode(tok, token));
         }
     }
+
+    int64_t total_ms = absolute_time_diff_us(gen_start, get_absolute_time()) / 1000;
+    printf("\n\n[%d tokens in %lld ms, %.0f ms/tok]\n",
+           tokens_generated, (long long)total_ms,
+           tokens_generated > 0 ? (float)total_ms / tokens_generated : 0.0f);
 
     return tokens_generated;
 }

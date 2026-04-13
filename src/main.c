@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "pico/multicore.h"
@@ -97,13 +98,20 @@ static bool load_config(Config *cfg) {
     return true;
 }
 
-// Skip over the vocab section (length-prefixed strings) and return the byte
-// offset where it ends, or 0 on read failure. Uses SCRATCH_BUF for temporary reads.
-static uint32_t skip_vocab(int vocab_size) {
-    uint32_t pos = sizeof(Config); // vocab starts right after the 28-byte header
-    int remaining = vocab_size;
+// Load vocab from SD into the Tokenizer and return the byte offset where
+// it ends (= start of weight data), or 0 on failure. Uses SCRATCH_BUF.
+static uint32_t load_vocab(Tokenizer *t, int vocab_size) {
+    t->vocab_size = vocab_size;
+    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
+    if (!t->vocab) {
+        printf("FATAL: malloc failed for vocab pointers\n");
+        return 0;
+    }
 
-    while (remaining > 0) {
+    uint32_t pos = sizeof(Config); // vocab starts right after the 28-byte header
+    int loaded = 0;
+
+    while (loaded < vocab_size) {
         uint32_t block = pos / 512;
         uint32_t block_off = pos % 512;
         uint32_t blocks = SCRATCH_SIZE / 512;
@@ -113,12 +121,19 @@ static uint32_t skip_vocab(int vocab_size) {
         uint32_t buf_bytes = blocks * 512;
         uint32_t local = block_off;
 
-        while (remaining > 0 && local + 2 <= buf_bytes) {
+        while (loaded < vocab_size && local + 2 <= buf_bytes) {
             uint16_t len = SCRATCH_BUF[local] | (SCRATCH_BUF[local + 1] << 8);
             if (local + 2 + len > buf_bytes)
                 break; // entry crosses buffer boundary, re-read from new position
+            t->vocab[loaded] = (char *)malloc(len + 1);
+            if (!t->vocab[loaded]) {
+                printf("FATAL: malloc failed for token %d\n", loaded);
+                return 0;
+            }
+            memcpy(t->vocab[loaded], SCRATCH_BUF + local + 2, len);
+            t->vocab[loaded][len] = '\0';
             local += 2 + len;
-            remaining--;
+            loaded++;
         }
 
         pos = block * 512 + local;
@@ -205,11 +220,12 @@ int main(void) {
     printf("  max_seq_len: %d\n", ctx.config.max_seq_len);
     printf("\n");
 
-    // --- Scan past vocab section to find weight offsets ---
-    printf("Scanning vocab (%d tokens)...\n", ctx.config.vocab_size);
-    ctx.layout.vocab_end = skip_vocab(ctx.config.vocab_size);
+    // --- Load vocab from SD ---
+    static Tokenizer tokenizer;
+    printf("Loading vocab (%d tokens)...\n", ctx.config.vocab_size);
+    ctx.layout.vocab_end = load_vocab(&tokenizer, ctx.config.vocab_size);
     if (ctx.layout.vocab_end == 0) {
-        printf("FATAL: SD read failed while scanning vocab.\n");
+        printf("FATAL: Could not load vocab from SD.\n");
         goto halt;
     }
     compute_layout(&ctx.layout, &ctx.config);
@@ -267,9 +283,9 @@ int main(void) {
 
     // --- Generate tokens ---
     // Start with token 0 (BOS) and generate up to 32 tokens
-    printf("Generating (BOS=0, max_tokens=32)...\n");
+    printf("Generating (BOS=0, max_tokens=32)...\n\n");
     int prompt[] = {0};
-    int n_generated = generate(&ctx, prompt, 1, 32);
+    int n_generated = generate(&ctx, &tokenizer, prompt, 1, 32);
     printf("\nGenerated %d tokens.\n", n_generated);
 
 halt:
