@@ -279,14 +279,49 @@ int main(void) {
     printf("  Emb read buf:   %lu bytes\n", (unsigned long)sizeof(emb_read_buf));
     printf("\n");
 
-    printf("pico-llm ready. Model loaded from SD.\n\n");
+    printf("pico-llm ready. Model loaded from SD.\n");
+    printf("Type a prompt and press Enter to generate.\n\n");
 
-    // --- Generate tokens ---
-    // Start with token 0 (BOS) and generate up to 32 tokens
-    printf("Generating (BOS=0, max_tokens=32)...\n\n");
-    int prompt[] = {0};
-    int n_generated = generate(&ctx, &tokenizer, prompt, 1, 32);
-    printf("\nGenerated %d tokens.\n", n_generated);
+    // --- Interactive generation loop ---
+    while (1) {
+        printf("> ");
+
+        // Read a line from USB serial with echo and backspace handling
+        char prompt_text[256];
+        int len = 0;
+        while (len < (int)sizeof(prompt_text) - 1) {
+            int c = getchar();
+            if (c == '\n' || c == '\r') {
+                putchar('\n');
+                break;
+            }
+            if (c == 0x7F || c == '\b') {
+                if (len > 0) {
+                    len--;
+                    printf("\b \b");
+                }
+                continue;
+            }
+            if (c >= 0x20 && c < 0x7F) {
+                prompt_text[len++] = (char)c;
+                putchar(c);
+            }
+        }
+        prompt_text[len] = '\0';
+
+        if (len == 0) continue;
+
+        // Encode: BOS token + prompt text
+        int tokens[256];
+        tokens[0] = 0; // BOS
+        int n_prompt = 1 + tokenizer_encode(&tokenizer, prompt_text,
+                                             tokens + 1, 255);
+
+        printf("[%d prompt tokens] ", n_prompt);
+
+        generate(&ctx, &tokenizer, tokens, n_prompt, 64);
+        printf("\n");
+    }
 
 halt:
     while (1) {
