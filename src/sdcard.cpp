@@ -142,9 +142,31 @@ bool sdcard_init(void) {
     status = sd_cmd(ACMD6, 2, &reply);
     if (status != SDIO_OK) { printf("SDIO: ACMD6 fail\n"); return false; }
 
-    // Use standard speed for now (skip high-speed CMD6 switch)
-    // TODO: re-enable high-speed once signal integrity is confirmed
+    // High-speed mode (50 MHz) — disabled pending PCB signal integrity fix
+    // To re-enable: change SDIO_STANDARD to SDIO_HIGHSPEED and uncomment CMD6
+#if 0
+    // CMD6: SWITCH_FUNC to SDR25 (50 MHz high-speed)
+    rp2350_sdio_mode_t speed_mode = SDIO_STANDARD;
+    uint8_t cmd6_status[64] __attribute__((aligned(4)));
+    status = rp2350_sdio_command_u32(CMD6, 0x80FFFF01, &reply, SDIO_FLAG_STOP_CLK);
+    if (status == SDIO_OK) {
+        status = rp2350_sdio_rx_start(cmd6_status, 1, 64);
+        if (status == SDIO_OK) {
+            do {
+                rp2350_sdio_poll_dma();
+                status = rp2350_sdio_rx_poll(NULL);
+            } while (status == SDIO_BUSY);
+        }
+        rp2350_sdio_stop();
+        if (status == SDIO_OK) {
+            busy_wait_us_32(1000);
+            speed_mode = SDIO_HIGHSPEED;
+        }
+    }
+    rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(speed_mode);
+#else
     rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(SDIO_STANDARD);
+#endif
     rp2350_sdio_init(hs_timing);
 
     // Set block length to 512 for data transfers
@@ -152,7 +174,7 @@ bool sdcard_init(void) {
 
     printf("SDIO init OK (%s, %s)\n",
            card_sdhc ? "SDHC" : "SD",
-           hs_timing.use_high_speed ? "high-speed" : "standard");
+           hs_timing.use_high_speed ? "high-speed 50MHz" : "standard 25MHz");
     return true;
 }
 
@@ -291,10 +313,14 @@ void weightbuf_init(WeightBuf *wb, int8_t *buf_a, int8_t *buf_b, uint32_t buf_si
 }
 
 void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t size) {
-    // Synchronous read on Core 0 (no double-buffering)
     uint32_t block = sd_byte_offset / 512;
     uint32_t block_count = (sd_byte_offset % 512 + size + 511) / 512;
+    // Clamp to buffer capacity to prevent overflow when offset is not block-aligned
+    uint32_t max_blocks = wb->buf_size / 512;
+    if (block_count > max_blocks) block_count = max_blocks;
 
+    // Synchronous read on Core 0 (Core 1 SDIO access hangs on CMD18 —
+    // PIO state machines don't reliably handle commands from Core 1)
     bool ok = sdcard_read_blocks(block, (uint8_t *)wb->prefetch, block_count);
     if (!ok) {
         printf("weightbuf prefetch failed at block %lu\n", (unsigned long)block);

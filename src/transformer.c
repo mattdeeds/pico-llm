@@ -172,14 +172,27 @@ void ws_read_bytes(WeightStream *ws, void *out, uint32_t nbytes) {
 }
 
 void ws_drain(WeightStream *ws) {
-    if (!ws->prefetch_pending) return;
+    // Discard any pending prefetch — it may not cover sd_off
+    if (ws->prefetch_pending) {
+        weightbuf_get(ws->wb);
+        ws->prefetch_pending = false;
+    }
 
+    // Re-read from current sd_off so the buffer is correctly aligned
+    uint32_t remaining = ws->end_sd_off - ws->sd_off;
+    if (remaining == 0) {
+        ws->buf_ptr = NULL;
+        ws->buf_off = 0;
+        ws->buf_valid = 0;
+        return;
+    }
+
+    uint32_t size = remaining < ws->wb->buf_size ? remaining : ws->wb->buf_size;
+    weightbuf_start_prefetch(ws->wb, ws->sd_off, size);
     ws->buf_ptr = weightbuf_get(ws->wb);
-    ws->prefetch_pending = false;
 
     uint32_t skip = ws->sd_off % 512;
     ws->buf_off = skip;
-    uint32_t remaining = ws->end_sd_off - ws->sd_off;
     uint32_t fetched = ws->wb->buf_size - skip;
     if (fetched > remaining) fetched = remaining;
     ws->buf_valid = skip + fetched;
@@ -205,21 +218,28 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols) {
     // Stack accumulator — max 704*4 = 2816 bytes for hidden_dim
     int32_t acc[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
+    int8_t row_tmp[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
 
     int rows_done = 0;
     while (rows_done < rows) {
-        ws_ensure(ws, (uint32_t)cols);
+        ws_ensure(ws, 1);
         uint32_t avail = ws->buf_valid - ws->buf_off;
         int tile_rows = avail / cols;
         if (tile_rows > rows - rows_done) tile_rows = rows - rows_done;
 
-        matmul_q8_tile(acc + rows_done,
-                       (const int8_t *)ws->buf_ptr + ws->buf_off,
-                       x_q, tile_rows, cols);
-
-        ws->buf_off += tile_rows * cols;
-        ws->sd_off += tile_rows * cols;
-        rows_done += tile_rows;
+        if (tile_rows > 0) {
+            matmul_q8_tile(acc + rows_done,
+                           (const int8_t *)ws->buf_ptr + ws->buf_off,
+                           x_q, tile_rows, cols);
+            ws->buf_off += tile_rows * cols;
+            ws->sd_off += tile_rows * cols;
+            rows_done += tile_rows;
+        } else {
+            // Row spans buffer boundary — read into scratch and process
+            ws_read_bytes(ws, row_tmp, cols);
+            matmul_q8_tile(acc + rows_done, row_tmp, x_q, 1, cols);
+            rows_done++;
+        }
     }
 
     // Read the float32 scale that follows the int8 weight data
@@ -236,6 +256,7 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
 void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
                            float x_scale, int rows, int cols) {
     int32_t acc[CHUNK_ROWS];
+    int8_t row_tmp[D_MODEL];
 
     int rows_done = 0;
     while (rows_done < rows) {
@@ -244,18 +265,24 @@ void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
 
         int chunk_done = 0;
         while (chunk_done < chunk) {
-            ws_ensure(ws, (uint32_t)cols);
+            ws_ensure(ws, 1);
             uint32_t avail = ws->buf_valid - ws->buf_off;
             int tile = avail / cols;
             if (tile > chunk - chunk_done) tile = chunk - chunk_done;
 
-            matmul_q8_tile(acc + chunk_done,
-                           (const int8_t *)ws->buf_ptr + ws->buf_off,
-                           x_q, tile, cols);
-
-            ws->buf_off += tile * cols;
-            ws->sd_off += tile * cols;
-            chunk_done += tile;
+            if (tile > 0) {
+                matmul_q8_tile(acc + chunk_done,
+                               (const int8_t *)ws->buf_ptr + ws->buf_off,
+                               x_q, tile, cols);
+                ws->buf_off += tile * cols;
+                ws->sd_off += tile * cols;
+                chunk_done += tile;
+            } else {
+                // Row spans buffer boundary — read into scratch and process
+                ws_read_bytes(ws, row_tmp, cols);
+                matmul_q8_tile(acc + chunk_done, row_tmp, x_q, 1, cols);
+                chunk_done++;
+            }
         }
 
         // Store as float with scale=1 (corrected after reading the real scale)

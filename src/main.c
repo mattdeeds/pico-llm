@@ -238,6 +238,8 @@ int main(void) {
     init_run_state(&ctx.state);
 
     // --- Initialize weight buffers (single-core synchronous mode) ---
+    // TODO: Core 1 SDIO prefetch causes CMD18 hang — PIO commands from Core 1
+    // don't return. Future options: single-core async DMA, or Core 1 for compute.
     static WeightBuf wb;
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
