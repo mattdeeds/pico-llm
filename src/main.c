@@ -202,6 +202,8 @@ int main(void) {
     // --- Load and validate model config ---
     TransformerContext ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.temperature = 0.7f;
+    ctx.repetition_penalty = 1.1f;
 
     printf("Loading model header...\n");
     if (!load_config(&ctx.config)) {
@@ -262,6 +264,7 @@ int main(void) {
 
     // --- Initialize run state ---
     init_run_state(&ctx.state);
+    ctx.state.rng_state = (uint64_t)time_us_64();
 
     // --- Initialize weight buffers and Core 1 compute worker ---
     static WeightBuf wb;
@@ -285,12 +288,12 @@ int main(void) {
     printf("\n");
 
     printf("pico-llm ready (Qwen3-0.6B). No on-device tokenizer.\n");
-    printf("Enter comma-separated token IDs to generate.\n");
-    printf("Example: 785,3974,13876,38835\n\n");
+    printf("  temperature=%.2f  repetition_penalty=%.2f\n",
+           ctx.temperature, ctx.repetition_penalty);
+    printf("Commands: /temp N, /rep N, /greedy\n");
+    printf("Otherwise enter comma-separated token IDs to generate.\n\n");
 
     // --- Interactive generation loop (token ID input) ---
-    // No on-device tokenizer for Qwen3 (151K vocab too large for RAM).
-    // User sends pre-tokenized token IDs, firmware generates and prints IDs.
     while (1) {
         printf("> ");
 
@@ -319,6 +322,27 @@ int main(void) {
 
         if (len == 0) continue;
 
+        // Handle slash commands
+        if (input[0] == '/') {
+            if (strncmp(input, "/temp ", 6) == 0) {
+                ctx.temperature = strtof(input + 6, NULL);
+                printf("temperature = %.2f\n", ctx.temperature);
+                continue;
+            } else if (strncmp(input, "/rep ", 5) == 0) {
+                ctx.repetition_penalty = strtof(input + 5, NULL);
+                printf("repetition_penalty = %.2f\n", ctx.repetition_penalty);
+                continue;
+            } else if (strcmp(input, "/greedy") == 0) {
+                ctx.temperature = 0.0f;
+                ctx.repetition_penalty = 1.0f;
+                printf("Greedy decoding (temp=0, rep=1)\n");
+                continue;
+            } else {
+                printf("Unknown command: %s\n", input);
+                continue;
+            }
+        }
+
         // Parse comma-separated token IDs
         int tokens[256];
         int n_prompt = 0;
@@ -328,9 +352,11 @@ int main(void) {
             if (*p == ',') p++;
         }
 
+        // Reset recent token history for each new prompt
+        ctx.state.recent_count = 0;
+
         printf("[%d prompt tokens] ", n_prompt);
 
-        // Generate (forward returns token IDs, print them)
         generate(&ctx, NULL, tokens, n_prompt, 64);
         printf("\n");
     }

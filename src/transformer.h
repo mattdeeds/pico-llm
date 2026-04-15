@@ -9,6 +9,9 @@
 #define Q_DIM  (N_HEADS * HEAD_DIM)
 #define KV_DIM (N_KV_HEADS * HEAD_DIM)
 
+// Repetition penalty history size
+#define RECENT_TOKENS_SIZE 64
+
 // Model configuration, read from the weight file header (V2: 8 fields)
 typedef struct {
     int dim;        // d_model (e.g. 1024)
@@ -63,6 +66,11 @@ typedef struct {
 
     // KV cache offset tracking (cache lives on SD card)
     int kv_cache_len;
+
+    // Sampling state
+    int recent_tokens[RECENT_TOKENS_SIZE]; // circular buffer of generated tokens
+    int recent_count;                       // total tokens generated (mod for index)
+    uint64_t rng_state;                     // LCG PRNG state
 } RunState;
 
 // Byte offsets into the model file on SD card
@@ -103,6 +111,10 @@ typedef struct {
 
     // Wcls scale for tied embedding dequantization
     float wcls_scale;
+
+    // Sampling parameters
+    float temperature;          // 0 = greedy, > 0 = Gumbel-max sampling
+    float repetition_penalty;   // 1.0 = no penalty, > 1.0 = penalize repeats
 } TransformerContext;
 
 // Compile-time RAM budget checks
@@ -133,10 +145,13 @@ void ws_resume(WeightStream *ws);
 void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols);
 
-// Streaming argmax: processes classifier in chunks, returns best token ID
-// without storing full logits vector (int32 comparison preserves ordering)
-int ws_streaming_argmax(WeightStream *ws, const int8_t *x_q,
-                        float x_scale, int rows, int cols);
+// Streaming token sampling: processes classifier in chunks using Gumbel-max
+// trick for temperature sampling with repetition penalty. Returns token ID.
+int ws_sample_token(WeightStream *ws, const int8_t *x_q,
+                    float x_scale, float w_scale, int rows, int cols,
+                    float temperature, float repetition_penalty,
+                    const int *recent_tokens, int recent_count,
+                    uint64_t *rng_state);
 
 // Math primitives
 void rmsnorm(float *out, const float *x, const float *weight, int size);

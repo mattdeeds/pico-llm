@@ -307,19 +307,48 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
 }
 
 // ============================================================================
-// Streaming argmax for large classifier (replaces ws_tiled_matmul_large)
+// Streaming token sampling (Gumbel-max + repetition penalty)
 // ============================================================================
 
 #define CHUNK_ROWS 256
 
-// Process classifier weight matrix in chunks, tracking argmax without
-// storing full logits vector. Int32 accumulator comparison is valid because
-// dequantization (multiply by positive scale) preserves ordering.
-int ws_streaming_argmax(WeightStream *ws, const int8_t *x_q,
-                        float x_scale __attribute__((unused)), int rows, int cols) {
+// Simple LCG PRNG
+static uint32_t rng_next(uint64_t *state) {
+    *state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (uint32_t)(*state >> 32);
+}
+
+// Gumbel noise: -log(-log(U)) where U ~ Uniform(0,1)
+static float gumbel_noise(uint64_t *rng_state) {
+    uint32_t u = rng_next(rng_state);
+    float u_norm = ((float)u + 1.0f) / 4294967298.0f;
+    return -logf(-logf(u_norm));
+}
+
+// Check if token_id is in the recent token history
+static bool is_recent(int token_id, const int *recent, int count) {
+    int len = count < RECENT_TOKENS_SIZE ? count : RECENT_TOKENS_SIZE;
+    for (int i = 0; i < len; i++) {
+        if (recent[i % RECENT_TOKENS_SIZE] == token_id)
+            return true;
+    }
+    return false;
+}
+
+// Process classifier in CHUNK_ROWS chunks with temperature sampling
+// (Gumbel-max trick) and repetition penalty. Returns selected token ID.
+//
+// When temperature=0: greedy argmax (dequantized float comparison).
+// When temperature>0: argmax(logit/T + Gumbel_noise) = sample from softmax(logit/T).
+int ws_sample_token(WeightStream *ws, const int8_t *x_q,
+                    float x_scale, float w_scale, int rows, int cols,
+                    float temperature, float repetition_penalty,
+                    const int *recent_tokens, int recent_count,
+                    uint64_t *rng_state) {
     int8_t row_tmp[D_MODEL];
     int best_token = 0;
-    int32_t best_acc = INT32_MIN;
+    float best_score = -1e30f;
+    float combined_scale = w_scale * x_scale;
 
     g_compute.x_q = x_q;
     g_compute.cols = cols;
@@ -367,19 +396,37 @@ int ws_streaming_argmax(WeightStream *ws, const int8_t *x_q,
             multicore_fifo_pop_blocking();
         }
 
-        // Scan chunk for best token (int32 comparison)
+        // Score each token in this chunk
         for (int i = 0; i < chunk; i++) {
-            if (matmul_acc[i] > best_acc) {
-                best_acc = matmul_acc[i];
+            float logit = (float)matmul_acc[i] * combined_scale;
+
+            // Repetition penalty
+            if (repetition_penalty != 1.0f &&
+                is_recent(rows_done + i, recent_tokens, recent_count)) {
+                logit = (logit > 0.0f)
+                    ? logit / repetition_penalty
+                    : logit * repetition_penalty;
+            }
+
+            // Temperature + Gumbel-max sampling
+            float score;
+            if (temperature > 0.0f) {
+                score = logit / temperature + gumbel_noise(rng_state);
+            } else {
+                score = logit;
+            }
+
+            if (score > best_score) {
+                best_score = score;
                 best_token = rows_done + i;
             }
         }
         rows_done += chunk;
     }
 
-    // Advance past scale in stream (not needed for argmax, but keeps stream aligned)
-    float w_scale;
-    ws_read_bytes(ws, &w_scale, sizeof(float));
+    // Advance past scale in stream (already have it, but keeps stream aligned)
+    float discard_scale;
+    ws_read_bytes(ws, &discard_scale, sizeof(float));
 
     return best_token;
 }
@@ -574,14 +621,17 @@ int forward(TransformerContext *ctx, int token, int pos) {
     // Final norm (weights already in RAM)
     rmsnorm(s->x, s->x, ctx->final_norm, dim);
 
-    // Classifier: streaming argmax over wcls (no logits buffer needed)
+    // Classifier: streaming sample over wcls
     uint32_t wcls_bytes = (uint32_t)cfg->vocab_size * dim + sizeof(float);
     WeightStream ws;
     ws_init(&ws, ctx->wb, ctx->layout.wcls_off, wcls_bytes);
 
     int8_t x_q[D_MODEL];
     float x_scale = quantize_vec(x_q, s->x, dim);
-    int next_token = ws_streaming_argmax(&ws, x_q, x_scale, cfg->vocab_size, dim);
+    int next_token = ws_sample_token(
+        &ws, x_q, x_scale, ctx->wcls_scale, cfg->vocab_size, dim,
+        ctx->temperature, ctx->repetition_penalty,
+        s->recent_tokens, s->recent_count, &s->rng_state);
     ws_drain(&ws);
 
     s->kv_cache_len = pos + 1;
@@ -617,6 +667,12 @@ int generate(TransformerContext *ctx, const Tokenizer *tok,
         } else {
             token = next_token;
             tokens_generated++;
+
+            // Track token in recent history (circular buffer)
+            RunState *s = &ctx->state;
+            s->recent_tokens[s->recent_count % RECENT_TOKENS_SIZE] = token;
+            s->recent_count++;
+
             // Print token ID (no on-device decoding for large-vocab models)
             if (tok && tok->vocab && token < tok->vocab_size) {
                 printf("%s", tok->vocab[token]);

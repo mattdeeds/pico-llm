@@ -144,7 +144,8 @@ def main():
         print("ERROR: Timed out waiting for '> ' prompt.")
         sys.exit(1)
 
-    print("\nReady. Type a prompt and press Enter. Ctrl-C to quit.\n")
+    print("\nReady. Type a prompt and press Enter. Ctrl-C to quit.")
+    print("Commands: /temp N, /rep N, /greedy (sent directly to board)\n")
 
     try:
         while True:
@@ -154,6 +155,17 @@ def main():
                 break
 
             if not text.strip():
+                continue
+
+            # Pass slash commands directly to board
+            if text.startswith("/"):
+                ser.write((text + "\n").encode("ascii"))
+                time.sleep(0.2)
+                if ser.in_waiting:
+                    resp = ser.read(ser.in_waiting).decode("utf-8", errors="replace")
+                    print(f"  {resp.strip()}")
+                # Wait for next prompt
+                wait_for_prompt(ser, timeout=5)
                 continue
 
             # Tokenize
