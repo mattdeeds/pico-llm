@@ -15,29 +15,30 @@ static int8_t weight_buf_b[WEIGHT_BUF_SIZE] __attribute__((aligned(4)));
 
 // Static allocation for RunState buffers
 static float x_buf[D_MODEL];
-static float xb_buf[D_MODEL];
+static float xb_buf[Q_DIM];      // also used for attention output [Q_DIM]
 static float xb2_buf[D_MODEL];
-static float q_buf[D_MODEL];
-static float k_buf[D_MODEL];
-static float v_buf[D_MODEL];
+static float q_buf[Q_DIM];
+static float k_buf[KV_DIM];
+static float v_buf[KV_DIM];
 static float att_buf[N_HEADS];
 static float hb_buf[HIDDEN_DIM];
 static float hb2_buf[HIDDEN_DIM];
-static float logits_buf[VOCAB_SIZE];
+// No logits buffer — streaming argmax computes argmax without storing logits
 
-// Final layer norm stays in RAM (dim * 4 bytes = 1024 bytes for dim=256)
+// Final layer norm stays in RAM
 static float final_norm_buf[D_MODEL];
 
-// Shared matmul accumulator for Core 1 compute (max 704 rows × 4 bytes = 2816 bytes)
-int32_t matmul_acc[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
+// Shared matmul accumulator for Core 1 compute
+// Needs to be large enough for: max(HIDDEN_DIM, Q_DIM, CHUNK_ROWS) int32 entries
+int32_t matmul_acc[HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM];
 
 // Scratch buffer for SD reads during init (reuses weight_buf_a before prefetch starts)
 #define SCRATCH_BUF ((uint8_t *)weight_buf_a)
 #define SCRATCH_SIZE WEIGHT_BUF_SIZE
 
-// Token embedding read buffer: enough for one embedding + alignment slop
-// dim*4 bytes, spanning at most ceil(dim*4/512)+1 blocks
-#define EMB_BLOCKS (((D_MODEL * 4 + 511) / 512) + 1)
+// Token embedding read buffer: reads D_MODEL int8 bytes from wcls (tied embeddings)
+#define EMB_BYTES D_MODEL
+#define EMB_BLOCKS (((EMB_BYTES + 511) / 512) + 1)
 static uint8_t emb_read_buf[EMB_BLOCKS * 512] __attribute__((aligned(4)));
 
 static void init_run_state(RunState *s) {
@@ -50,7 +51,6 @@ static void init_run_state(RunState *s) {
     s->att = att_buf;
     s->hb = hb_buf;
     s->hb2 = hb2_buf;
-    s->logits = logits_buf;
     s->kv_cache_len = 0;
 }
 
@@ -59,7 +59,6 @@ static void init_run_state(RunState *s) {
 // ============================================================================
 
 // Read arbitrary bytes from SD at a non-block-aligned offset.
-// tmp must be 4-byte aligned and large enough: ceil((byte_off%512 + nbytes) / 512) blocks.
 static bool sd_read_bytes(uint32_t byte_off, void *out, uint32_t nbytes,
                           uint8_t *tmp, uint32_t tmp_size) {
     uint32_t block = byte_off / 512;
@@ -73,8 +72,7 @@ static bool sd_read_bytes(uint32_t byte_off, void *out, uint32_t nbytes,
     return true;
 }
 
-// Read the 7 x int32 config header from block 0 of the SD card.
-// Returns false if the read fails or the config doesn't match compile-time values.
+// Read the V2 config header (8 x int32) from block 0 of the SD card.
 static bool load_config(Config *cfg) {
     Config sd;
     if (!sd_read_bytes(0, &sd, sizeof(Config), SCRATCH_BUF, SCRATCH_SIZE))
@@ -83,14 +81,14 @@ static bool load_config(Config *cfg) {
     if (sd.dim != D_MODEL || sd.hidden_dim != HIDDEN_DIM ||
         sd.n_layers != N_LAYERS || sd.n_heads != N_HEADS ||
         sd.n_kv_heads != N_KV_HEADS || sd.vocab_size != VOCAB_SIZE ||
-        sd.max_seq_len != MAX_SEQ_LEN) {
+        sd.max_seq_len != MAX_SEQ_LEN || sd.head_dim != HEAD_DIM) {
         printf("ERROR: SD model config does not match firmware\n");
-        printf("  SD:  dim=%d hidden=%d layers=%d heads=%d kv=%d vocab=%d seq=%d\n",
+        printf("  SD:  dim=%d hidden=%d layers=%d heads=%d kv=%d vocab=%d seq=%d head_dim=%d\n",
                sd.dim, sd.hidden_dim, sd.n_layers, sd.n_heads,
-               sd.n_kv_heads, sd.vocab_size, sd.max_seq_len);
-        printf("  FW:  dim=%d hidden=%d layers=%d heads=%d kv=%d vocab=%d seq=%d\n",
+               sd.n_kv_heads, sd.vocab_size, sd.max_seq_len, sd.head_dim);
+        printf("  FW:  dim=%d hidden=%d layers=%d heads=%d kv=%d vocab=%d seq=%d head_dim=%d\n",
                D_MODEL, HIDDEN_DIM, N_LAYERS, N_HEADS,
-               N_KV_HEADS, VOCAB_SIZE, MAX_SEQ_LEN);
+               N_KV_HEADS, VOCAB_SIZE, MAX_SEQ_LEN, HEAD_DIM);
         return false;
     }
 
@@ -98,20 +96,14 @@ static bool load_config(Config *cfg) {
     return true;
 }
 
-// Load vocab from SD into the Tokenizer and return the byte offset where
-// it ends (= start of weight data), or 0 on failure. Uses SCRATCH_BUF.
-static uint32_t load_vocab(Tokenizer *t, int vocab_size) {
-    t->vocab_size = vocab_size;
-    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
-    if (!t->vocab) {
-        printf("FATAL: malloc failed for vocab pointers\n");
-        return 0;
-    }
+// Scan vocab section on SD to find the end offset (= start of weight data).
+// Does NOT load vocab into RAM — vocab is too large for Qwen3 (151K tokens).
+// Returns the byte offset past the last token, or 0 on failure.
+static uint32_t scan_vocab_end(int vocab_size) {
+    uint32_t pos = sizeof(Config); // vocab starts right after header
+    int scanned = 0;
 
-    uint32_t pos = sizeof(Config); // vocab starts right after the 28-byte header
-    int loaded = 0;
-
-    while (loaded < vocab_size) {
+    while (scanned < vocab_size) {
         uint32_t block = pos / 512;
         uint32_t block_off = pos % 512;
         uint32_t blocks = SCRATCH_SIZE / 512;
@@ -121,19 +113,12 @@ static uint32_t load_vocab(Tokenizer *t, int vocab_size) {
         uint32_t buf_bytes = blocks * 512;
         uint32_t local = block_off;
 
-        while (loaded < vocab_size && local + 2 <= buf_bytes) {
+        while (scanned < vocab_size && local + 2 <= buf_bytes) {
             uint16_t len = SCRATCH_BUF[local] | (SCRATCH_BUF[local + 1] << 8);
             if (local + 2 + len > buf_bytes)
-                break; // entry crosses buffer boundary, re-read from new position
-            t->vocab[loaded] = (char *)malloc(len + 1);
-            if (!t->vocab[loaded]) {
-                printf("FATAL: malloc failed for token %d\n", loaded);
-                return 0;
-            }
-            memcpy(t->vocab[loaded], SCRATCH_BUF + local + 2, len);
-            t->vocab[loaded][len] = '\0';
+                break;
             local += 2 + len;
-            loaded++;
+            scanned++;
         }
 
         pos = block * 512 + local;
@@ -142,35 +127,49 @@ static uint32_t load_vocab(Tokenizer *t, int vocab_size) {
     return pos;
 }
 
-// Compute all byte offsets into the model file.
+// Compute all byte offsets into the V2 model file.
 static void compute_layout(ModelLayout *layout, const Config *cfg) {
     int dim = cfg->dim;
-    int kv_dim = (dim / cfg->n_heads) * cfg->n_kv_heads;
+    int head_dim = cfg->head_dim;
+    int q_dim = cfg->n_heads * head_dim;
+    int kv_dim = cfg->n_kv_heads * head_dim;
     int hidden = cfg->hidden_dim;
 
     uint32_t layer = 0;
-    layer += dim * 4;                   // attn_norm
-    layer += dim * dim + 4;             // wq
-    layer += kv_dim * dim + 4;          // wk
-    layer += kv_dim * dim + 4;          // wv
-    layer += dim * dim + 4;             // wo
-    layer += dim * 4;                   // ffn_norm
-    layer += hidden * dim + 4;          // w_gate
-    layer += hidden * dim + 4;          // w_up
-    layer += dim * hidden + 4;          // w_down
+    layer += dim * 4;                   // attn_norm  [dim] float32
+    layer += head_dim * 4;              // q_norm     [head_dim] float32
+    layer += head_dim * 4;              // k_norm     [head_dim] float32
+    layer += q_dim * dim + 4;           // wq         [q_dim x dim] int8 + scale
+    layer += kv_dim * dim + 4;          // wk         [kv_dim x dim] int8 + scale
+    layer += kv_dim * dim + 4;          // wv         [kv_dim x dim] int8 + scale
+    layer += dim * q_dim + 4;           // wo         [dim x q_dim] int8 + scale
+    layer += dim * 4;                   // ffn_norm   [dim] float32
+    layer += hidden * dim + 4;          // w_gate     [hidden x dim] int8 + scale
+    layer += hidden * dim + 4;          // w_up       [hidden x dim] int8 + scale
+    layer += dim * hidden + 4;          // w_down     [dim x hidden] int8 + scale
     layout->layer_bytes = layer;
 
     uint32_t after_layers = layout->vocab_end + (uint32_t)cfg->n_layers * layer;
     layout->final_norm_off = after_layers;
     layout->wcls_off = layout->final_norm_off + dim * 4;
-    layout->emb_off = layout->wcls_off + cfg->vocab_size * dim + 4;
+    // wcls scale is at the end of wcls data: wcls_off + vocab_size * dim
+    layout->wcls_scale_off = layout->wcls_off + (uint32_t)cfg->vocab_size * dim;
 }
 
+// Load a single token embedding from SD (tied embeddings: read int8 from wcls, dequantize).
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out) {
-    uint32_t byte_off = ctx->layout.emb_off
-                        + (uint32_t)token_id * D_MODEL * sizeof(float);
-    return sd_read_bytes(byte_off, out, D_MODEL * sizeof(float),
-                         emb_read_buf, sizeof(emb_read_buf));
+    uint32_t byte_off = ctx->layout.wcls_off
+                        + (uint32_t)token_id * D_MODEL; // int8 data, 1 byte per element
+    int8_t emb_int8[D_MODEL];
+    if (!sd_read_bytes(byte_off, emb_int8, D_MODEL, emb_read_buf, sizeof(emb_read_buf)))
+        return false;
+
+    // Dequantize: float = int8 * scale
+    float scale = ctx->wcls_scale;
+    for (int i = 0; i < D_MODEL; i++) {
+        out[i] = (float)emb_int8[i] * scale;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -188,7 +187,7 @@ int main(void) {
 
     printf("\n");
     printf("=========================\n");
-    printf("  pico-llm v0.1\n");
+    printf("  pico-llm v0.2 (Qwen3)\n");
     printf("  Bare metal LLM on RP2350\n");
     printf("=========================\n\n");
 
@@ -218,21 +217,22 @@ int main(void) {
     printf("  kv_heads:    %d\n", ctx.config.n_kv_heads);
     printf("  vocab:       %d\n", ctx.config.vocab_size);
     printf("  max_seq_len: %d\n", ctx.config.max_seq_len);
+    printf("  head_dim:    %d\n", ctx.config.head_dim);
+    printf("  q_dim:       %d\n", ctx.config.n_heads * ctx.config.head_dim);
+    printf("  kv_dim:      %d\n", ctx.config.n_kv_heads * ctx.config.head_dim);
     printf("\n");
 
-    // --- Load vocab from SD ---
-    static Tokenizer tokenizer;
-    printf("Loading vocab (%d tokens)...\n", ctx.config.vocab_size);
-    ctx.layout.vocab_end = load_vocab(&tokenizer, ctx.config.vocab_size);
+    // --- Scan vocab section to find weight start offset ---
+    printf("Scanning vocab (%d tokens)...\n", ctx.config.vocab_size);
+    ctx.layout.vocab_end = scan_vocab_end(ctx.config.vocab_size);
     if (ctx.layout.vocab_end == 0) {
-        printf("FATAL: Could not load vocab from SD.\n");
+        printf("FATAL: Could not scan vocab section on SD.\n");
         goto halt;
     }
     compute_layout(&ctx.layout, &ctx.config);
 
-    // KV cache lives on SD after all model data, block-aligned
-    uint32_t model_end = ctx.layout.emb_off
-                       + (uint32_t)VOCAB_SIZE * D_MODEL * sizeof(float);
+    // KV cache lives on SD after wcls data + scale
+    uint32_t model_end = ctx.layout.wcls_scale_off + sizeof(float);
     ctx.layout.kv_base_block = (model_end + 511) / 512;
 
     printf("Model layout (byte offsets on SD):\n");
@@ -240,7 +240,6 @@ int main(void) {
     printf("  layer size:     %lu bytes\n", (unsigned long)ctx.layout.layer_bytes);
     printf("  final_norm:     %lu\n", (unsigned long)ctx.layout.final_norm_off);
     printf("  classifier:     %lu\n", (unsigned long)ctx.layout.wcls_off);
-    printf("  embeddings:     %lu\n", (unsigned long)ctx.layout.emb_off);
     printf("  kv_cache:       block %lu\n", (unsigned long)ctx.layout.kv_base_block);
     printf("\n");
 
@@ -253,17 +252,23 @@ int main(void) {
         goto halt;
     }
 
+    // --- Load wcls scale for tied embedding dequantization ---
+    if (!sd_read_bytes(ctx.layout.wcls_scale_off, &ctx.wcls_scale,
+                       sizeof(float), SCRATCH_BUF, SCRATCH_SIZE)) {
+        printf("FATAL: Could not load wcls scale from SD.\n");
+        goto halt;
+    }
+    printf("Wcls scale: %f\n", ctx.wcls_scale);
+
     // --- Initialize run state ---
     init_run_state(&ctx.state);
 
     // --- Initialize weight buffers and Core 1 compute worker ---
-    // Core 0: all SD card reads (async DMA, IRQ handler chains blocks)
-    // Core 1: matmul compute (dispatched via multicore FIFO)
     static WeightBuf wb;
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
     multicore_launch_core1(compute_worker);
-    printf("Weight streaming ready (dual-core: Core 0 IO, Core 1 compute).\n\n");
+    printf("Weight streaming ready (dual-core).\n\n");
 
     // --- Print RAM usage ---
     printf("RAM usage:\n");
@@ -274,22 +279,25 @@ int main(void) {
            (unsigned long)(sizeof(q_buf) + sizeof(k_buf) + sizeof(v_buf) + sizeof(att_buf)));
     printf("  FFN:            %lu bytes\n",
            (unsigned long)(sizeof(hb_buf) + sizeof(hb2_buf)));
-    printf("  Logits:         %lu bytes\n", (unsigned long)sizeof(logits_buf));
     printf("  Final norm:     %lu bytes\n", (unsigned long)sizeof(final_norm_buf));
     printf("  Emb read buf:   %lu bytes\n", (unsigned long)sizeof(emb_read_buf));
+    printf("  Matmul acc:     %lu bytes\n", (unsigned long)sizeof(matmul_acc));
     printf("\n");
 
-    printf("pico-llm ready. Model loaded from SD.\n");
-    printf("Type a prompt and press Enter to generate.\n\n");
+    printf("pico-llm ready (Qwen3-0.6B). No on-device tokenizer.\n");
+    printf("Enter comma-separated token IDs to generate.\n");
+    printf("Example: 785,3974,13876,38835\n\n");
 
-    // --- Interactive generation loop ---
+    // --- Interactive generation loop (token ID input) ---
+    // No on-device tokenizer for Qwen3 (151K vocab too large for RAM).
+    // User sends pre-tokenized token IDs, firmware generates and prints IDs.
     while (1) {
         printf("> ");
 
-        // Read a line from USB serial with echo and backspace handling
-        char prompt_text[256];
+        // Read a line from USB serial
+        char input[512];
         int len = 0;
-        while (len < (int)sizeof(prompt_text) - 1) {
+        while (len < (int)sizeof(input) - 1) {
             int c = getchar();
             if (c == '\n' || c == '\r') {
                 putchar('\n');
@@ -303,23 +311,27 @@ int main(void) {
                 continue;
             }
             if (c >= 0x20 && c < 0x7F) {
-                prompt_text[len++] = (char)c;
+                input[len++] = (char)c;
                 putchar(c);
             }
         }
-        prompt_text[len] = '\0';
+        input[len] = '\0';
 
         if (len == 0) continue;
 
-        // Encode: BOS token + prompt text
+        // Parse comma-separated token IDs
         int tokens[256];
-        tokens[0] = 0; // BOS
-        int n_prompt = 1 + tokenizer_encode(&tokenizer, prompt_text,
-                                             tokens + 1, 255);
+        int n_prompt = 0;
+        char *p = input;
+        while (*p && n_prompt < 256) {
+            tokens[n_prompt++] = (int)strtol(p, &p, 10);
+            if (*p == ',') p++;
+        }
 
         printf("[%d prompt tokens] ", n_prompt);
 
-        generate(&ctx, &tokenizer, tokens, n_prompt, 64);
+        // Generate (forward returns token IDs, print them)
+        generate(&ctx, NULL, tokens, n_prompt, 64);
         printf("\n");
     }
 

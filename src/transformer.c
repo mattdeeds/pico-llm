@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 
 // Shared state for Core 1 compute worker (defined in sdcard.cpp)
 typedef struct {
@@ -20,6 +21,9 @@ extern ComputeState g_compute;
 // Shared matmul accumulator (defined in main.c)
 extern int32_t matmul_acc[];
 
+// Max cols for any matmul (for row_tmp VLA in tiled matmul)
+#define MAX_MATMUL_COLS (HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM)
+
 // ============================================================================
 // Math primitives
 // ============================================================================
@@ -29,7 +33,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size) {
     for (int i = 0; i < size; i++) {
         ss += x[i] * x[i];
     }
-    ss = 1.0f / sqrtf(ss / size + 1e-5f);
+    ss = 1.0f / sqrtf(ss / size + RMSNORM_EPS);
     for (int i = 0; i < size; i++) {
         out[i] = x[i] * ss * weight[i];
     }
@@ -54,25 +58,53 @@ void softmax(float *x, int size) {
     }
 }
 
-void rope(float *q, float *k, int dim, int head_size, int pos) {
-    for (int i = 0; i < dim; i += 2) {
-        int head_dim = i % head_size;
-        float freq = 1.0f / powf(10000.0f, (float)head_dim / (float)head_size);
-        float val = pos * freq;
-        float cos_val = cosf(val);
-        float sin_val = sinf(val);
+// Split-half RoPE (HuggingFace/Qwen3 convention).
+// Pairs element i with element i+half within each head.
+void rope_split_half(float *q, float *k, int q_dim, int kv_dim,
+                     int head_dim, int pos) {
+    int half = head_dim / 2;
+    int n_q_heads = q_dim / head_dim;
+    int n_kv_heads = kv_dim / head_dim;
 
-        float q0 = q[i];
-        float q1 = q[i + 1];
-        q[i]     = q0 * cos_val - q1 * sin_val;
-        q[i + 1] = q0 * sin_val + q1 * cos_val;
-
-        if (k) {
-            float k0 = k[i];
-            float k1 = k[i + 1];
-            k[i]     = k0 * cos_val - k1 * sin_val;
-            k[i + 1] = k0 * sin_val + k1 * cos_val;
+    for (int h = 0; h < n_q_heads; h++) {
+        for (int i = 0; i < half; i++) {
+            float freq = 1.0f / powf(ROPE_THETA, (2.0f * i) / (float)head_dim);
+            float val = pos * freq;
+            float cos_val = cosf(val);
+            float sin_val = sinf(val);
+            int idx1 = h * head_dim + i;
+            int idx2 = h * head_dim + i + half;
+            float a = q[idx1], b = q[idx2];
+            q[idx1] = a * cos_val - b * sin_val;
+            q[idx2] = b * cos_val + a * sin_val;
         }
+    }
+
+    if (k) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(ROPE_THETA, (2.0f * i) / (float)head_dim);
+                float val = pos * freq;
+                float cos_val = cosf(val);
+                float sin_val = sinf(val);
+                int idx1 = h * head_dim + i;
+                int idx2 = h * head_dim + i + half;
+                float a = k[idx1], b = k[idx2];
+                k[idx1] = a * cos_val - b * sin_val;
+                k[idx2] = b * cos_val + a * sin_val;
+            }
+        }
+    }
+}
+
+// Per-head RMSNorm on Q and K vectors (QK-Norm).
+void qk_norm(float *q, float *k, const float *q_norm_w,
+             const float *k_norm_w, int n_heads, int n_kv_heads, int head_dim) {
+    for (int h = 0; h < n_heads; h++) {
+        rmsnorm(q + h * head_dim, q + h * head_dim, q_norm_w, head_dim);
+    }
+    for (int h = 0; h < n_kv_heads; h++) {
+        rmsnorm(k + h * head_dim, k + h * head_dim, k_norm_w, head_dim);
     }
 }
 
@@ -185,13 +217,11 @@ void ws_read_bytes(WeightStream *ws, void *out, uint32_t nbytes) {
 }
 
 void ws_drain(WeightStream *ws) {
-    // Discard any pending prefetch — it may not cover sd_off
     if (ws->prefetch_pending) {
         weightbuf_get(ws->wb);
         ws->prefetch_pending = false;
     }
 
-    // Re-read from current sd_off so the buffer is correctly aligned
     uint32_t remaining = ws->end_sd_off - ws->sd_off;
     if (remaining == 0) {
         ws->buf_ptr = NULL;
@@ -212,7 +242,6 @@ void ws_drain(WeightStream *ws) {
 }
 
 void ws_resume(WeightStream *ws) {
-    // Compute SD offset of the byte right after what's in the current buffer
     uint32_t in_buf = ws->buf_valid - ws->buf_off;
     uint32_t next_sd_off = ws->sd_off + in_buf;
     if (next_sd_off < ws->end_sd_off) {
@@ -229,7 +258,7 @@ void ws_resume(WeightStream *ws) {
 
 void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols) {
-    int8_t row_tmp[HIDDEN_DIM > D_MODEL ? HIDDEN_DIM : D_MODEL];
+    int8_t row_tmp[MAX_MATMUL_COLS];
 
     // Set up shared state for Core 1 compute worker
     g_compute.x_q = x_q;
@@ -241,8 +270,6 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
     bool core1_busy = false;
 
     while (rows_sent < rows) {
-        // Sync with Core 1 before loading a new buffer (prevents overwriting
-        // the buffer Core 1 is reading when ws_ensure swaps + starts prefetch)
         if (core1_busy) {
             multicore_fifo_pop_blocking();
             core1_busy = false;
@@ -254,7 +281,6 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
         if (tile_rows > rows - rows_sent) tile_rows = rows - rows_sent;
 
         if (tile_rows > 0) {
-            // Dispatch tile to Core 1
             multicore_fifo_push_blocking((uint32_t)(ws->buf_ptr + ws->buf_off));
             multicore_fifo_push_blocking((uint32_t)tile_rows);
             core1_busy = true;
@@ -262,9 +288,7 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
             ws->buf_off += tile_rows * cols;
             ws->sd_off += tile_rows * cols;
             rows_sent += tile_rows;
-            // Core 1 computes while Core 0 loops to load next buffer (async DMA)
         } else {
-            // Row spans buffer boundary — handle on Core 0
             ws_read_bytes(ws, row_tmp, cols);
             matmul_q8_tile(matmul_acc + g_compute.rows_done,
                            row_tmp, x_q, 1, cols);
@@ -277,22 +301,26 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
         multicore_fifo_pop_blocking();
     }
 
-    // Read the float32 scale that follows the int8 weight data
     float w_scale;
     ws_read_bytes(ws, &w_scale, sizeof(float));
-
     dequant_acc(out, matmul_acc, w_scale, x_scale, rows);
 }
 
-// Chunked variant for large output dimensions (classifier: vocab_size rows).
-// Processes CHUNK_ROWS rows at a time to avoid a huge VLA.
+// ============================================================================
+// Streaming argmax for large classifier (replaces ws_tiled_matmul_large)
+// ============================================================================
+
 #define CHUNK_ROWS 256
 
-void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
-                           float x_scale, int rows, int cols) {
+// Process classifier weight matrix in chunks, tracking argmax without
+// storing full logits vector. Int32 accumulator comparison is valid because
+// dequantization (multiply by positive scale) preserves ordering.
+int ws_streaming_argmax(WeightStream *ws, const int8_t *x_q,
+                        float x_scale __attribute__((unused)), int rows, int cols) {
     int8_t row_tmp[D_MODEL];
+    int best_token = 0;
+    int32_t best_acc = INT32_MIN;
 
-    // Use shared accumulator for each chunk
     g_compute.x_q = x_q;
     g_compute.cols = cols;
 
@@ -339,28 +367,27 @@ void ws_tiled_matmul_large(WeightStream *ws, float *out, const int8_t *x_q,
             multicore_fifo_pop_blocking();
         }
 
-        // Store as float with scale=1 (corrected after reading the real scale)
+        // Scan chunk for best token (int32 comparison)
         for (int i = 0; i < chunk; i++) {
-            out[rows_done + i] = (float)matmul_acc[i];
+            if (matmul_acc[i] > best_acc) {
+                best_acc = matmul_acc[i];
+                best_token = rows_done + i;
+            }
         }
         rows_done += chunk;
     }
 
-    // Read the real scale and apply
+    // Advance past scale in stream (not needed for argmax, but keeps stream aligned)
     float w_scale;
     ws_read_bytes(ws, &w_scale, sizeof(float));
 
-    float combined = w_scale * x_scale;
-    for (int i = 0; i < rows; i++) {
-        out[i] *= combined;
-    }
+    return best_token;
 }
 
 // ============================================================================
 // KV cache on SD card
 // ============================================================================
 
-// Bytes per KV entry: K[kv_dim] + V[kv_dim], both float32
 #define KV_ENTRY_FLOATS(kv_dim) (2 * (kv_dim))
 #define KV_ENTRY_BYTES(kv_dim) (KV_ENTRY_FLOATS(kv_dim) * (int)sizeof(float))
 #define KV_ENTRY_BLOCKS(kv_dim) (KV_ENTRY_BYTES(kv_dim) / 512)
@@ -374,11 +401,10 @@ static uint32_t kv_block(const TransformerContext *ctx, int layer, int pos,
 
 static void kv_cache_write(TransformerContext *ctx, int layer, int pos,
                            const float *k, const float *v) {
-    int kv_dim = (ctx->config.dim / ctx->config.n_heads) * ctx->config.n_kv_heads;
+    int kv_dim = ctx->config.n_kv_heads * ctx->config.head_dim;
     int kv_bytes = kv_dim * (int)sizeof(float);
     int entry_blocks = KV_ENTRY_BLOCKS(kv_dim);
 
-    // Pack K and V into the idle prefetch buffer
     uint8_t *buf = (uint8_t *)ctx->wb->prefetch;
     memcpy(buf, k, kv_bytes);
     memcpy(buf + kv_bytes, v, kv_bytes);
@@ -388,31 +414,26 @@ static void kv_cache_write(TransformerContext *ctx, int layer, int pos,
 }
 
 // Online attention over KV cache stored on SD.
-// Reads KV entries in batches for efficiency, processes all heads per batch.
 static void attention_sd(TransformerContext *ctx, int layer, int pos,
                          const float *q, float *out) {
-    int dim = ctx->config.dim;
     int n_heads = ctx->config.n_heads;
     int n_kv_heads = ctx->config.n_kv_heads;
-    int head_size = dim / n_heads;
-    int kv_dim = head_size * n_kv_heads;
+    int head_size = ctx->config.head_dim;
+    int kv_dim = n_kv_heads * head_size;
     int kv_bytes = kv_dim * (int)sizeof(float);
     int entry_bytes = 2 * kv_bytes;
     int entry_blocks = entry_bytes / 512;
     int heads_per_kv = n_heads / n_kv_heads;
 
-    // Reuse the idle prefetch buffer for batch reads
     uint8_t *buf = (uint8_t *)ctx->wb->prefetch;
     int entries_per_batch = ctx->wb->buf_size / entry_bytes;
 
-    // Initialize all heads
     float max_scores[N_HEADS], sum_exps[N_HEADS];
     for (int h = 0; h < n_heads; h++) {
         attention_online_init(&max_scores[h], &sum_exps[h],
                               out + h * head_size, head_size);
     }
 
-    // Batch-read KV entries from SD
     for (int t_base = 0; t_base <= pos; t_base += entries_per_batch) {
         int t_end = t_base + entries_per_batch;
         if (t_end > pos + 1) t_end = pos + 1;
@@ -446,20 +467,21 @@ static void attention_sd(TransformerContext *ctx, int layer, int pos,
 }
 
 // ============================================================================
-// Forward pass
+// Forward pass (V2 format: QK-Norm, split-half RoPE, streaming argmax)
 // ============================================================================
 
-float *forward(TransformerContext *ctx, int token, int pos) {
+int forward(TransformerContext *ctx, int token, int pos) {
     Config *cfg = &ctx->config;
     RunState *s = &ctx->state;
     int dim = cfg->dim;
-    int kv_dim = (dim / cfg->n_heads) * cfg->n_kv_heads;
-    int head_size = dim / cfg->n_heads;
+    int head_dim = cfg->head_dim;
+    int q_dim = cfg->n_heads * head_dim;
+    int kv_dim = cfg->n_kv_heads * head_dim;
     int hidden_dim = cfg->hidden_dim;
 
-    // 1. Load token embedding
+    // 1. Load token embedding (tied: int8 from wcls, dequantized)
     if (!load_token_embedding(ctx, token, s->x))
-        return NULL;
+        return -1;
 
     for (int l = 0; l < cfg->n_layers; l++) {
         uint32_t layer_off = ctx->layout.vocab_end
@@ -474,17 +496,27 @@ float *forward(TransformerContext *ctx, int token, int pos) {
         ws_read_bytes(&ws, attn_norm, dim * sizeof(float));
         rmsnorm(s->xb, s->x, attn_norm, dim);
 
+        // QK-Norm weights
+        float q_norm_w[HEAD_DIM];
+        float k_norm_w[HEAD_DIM];
+        ws_read_bytes(&ws, q_norm_w, head_dim * sizeof(float));
+        ws_read_bytes(&ws, k_norm_w, head_dim * sizeof(float));
+
         // Quantize normalized input once for Q/K/V projections
         int8_t xb_q[D_MODEL];
         float xb_scale = quantize_vec(xb_q, s->xb, dim);
 
         // Q, K, V projections (tiled matmul from stream)
-        ws_tiled_matmul(&ws, s->q, xb_q, xb_scale, dim, dim);
+        ws_tiled_matmul(&ws, s->q, xb_q, xb_scale, q_dim, dim);
         ws_tiled_matmul(&ws, s->k, xb_q, xb_scale, kv_dim, dim);
         ws_tiled_matmul(&ws, s->v, xb_q, xb_scale, kv_dim, dim);
 
-        // RoPE
-        rope(s->q, s->k, kv_dim, head_size, pos);
+        // QK-Norm: per-head RMSNorm on Q and K
+        qk_norm(s->q, s->k, q_norm_w, k_norm_w,
+                cfg->n_heads, cfg->n_kv_heads, head_dim);
+
+        // RoPE (split-half convention)
+        rope_split_half(s->q, s->k, q_dim, kv_dim, head_dim, pos);
 
         // === Phase 2: Attention (Core 0 owns SD) ===
 
@@ -493,17 +525,19 @@ float *forward(TransformerContext *ctx, int token, int pos) {
         // Write K, V to SD KV cache
         kv_cache_write(ctx, l, pos, s->k, s->v);
 
-        // Online attention over SD KV cache → output in s->xb
+        // Online attention over SD KV cache → output in s->xb [Q_DIM]
         attention_sd(ctx, l, pos, s->q, s->xb);
 
         // === Phase 3: Post-attention weights (streamed) ===
 
         ws_resume(&ws);
 
-        // Output projection: wo @ attention_output
-        int8_t att_q[D_MODEL];
-        float att_scale = quantize_vec(att_q, s->xb, dim);
-        ws_tiled_matmul(&ws, s->xb2, att_q, att_scale, dim, dim);
+        // Output projection: wo @ attention_output [dim x q_dim]
+        {
+            int8_t att_q[Q_DIM];
+            float att_scale = quantize_vec(att_q, s->xb, q_dim);
+            ws_tiled_matmul(&ws, s->xb2, att_q, att_scale, dim, q_dim);
+        }
 
         // Residual
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
@@ -525,9 +559,11 @@ float *forward(TransformerContext *ctx, int token, int pos) {
         }
 
         // Down projection
-        int8_t hb_q[HIDDEN_DIM];
-        float hb_scale = quantize_vec(hb_q, s->hb, hidden_dim);
-        ws_tiled_matmul(&ws, s->xb2, hb_q, hb_scale, dim, hidden_dim);
+        {
+            int8_t hb_q[HIDDEN_DIM];
+            float hb_scale = quantize_vec(hb_q, s->hb, hidden_dim);
+            ws_tiled_matmul(&ws, s->xb2, hb_q, hb_scale, dim, hidden_dim);
+        }
 
         // Residual
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
@@ -538,57 +574,23 @@ float *forward(TransformerContext *ctx, int token, int pos) {
     // Final norm (weights already in RAM)
     rmsnorm(s->x, s->x, ctx->final_norm, dim);
 
-    // Classifier: stream wcls from SD
+    // Classifier: streaming argmax over wcls (no logits buffer needed)
     uint32_t wcls_bytes = (uint32_t)cfg->vocab_size * dim + sizeof(float);
     WeightStream ws;
     ws_init(&ws, ctx->wb, ctx->layout.wcls_off, wcls_bytes);
 
     int8_t x_q[D_MODEL];
     float x_scale = quantize_vec(x_q, s->x, dim);
-    ws_tiled_matmul_large(&ws, s->logits, x_q, x_scale, cfg->vocab_size, dim);
+    int next_token = ws_streaming_argmax(&ws, x_q, x_scale, cfg->vocab_size, dim);
     ws_drain(&ws);
 
     s->kv_cache_len = pos + 1;
-    return s->logits;
+    return next_token;
 }
 
 // ============================================================================
 // Token generation
 // ============================================================================
-
-static int argmax(const float *v, int n) {
-    int max_i = 0;
-    float max_v = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_v) {
-            max_v = v[i];
-            max_i = i;
-        }
-    }
-    return max_i;
-}
-
-// Print a BPE token, decoding byte-level encoding.
-// HuggingFace byte-level BPE maps non-printable bytes to U+0100-U+01FF,
-// which appear as 2-byte UTF-8 sequences (0xC4 xx or 0xC5 xx).
-// Common: Ġ (0xC4 0xA0) = space, Ċ (0xC4 0x8A) = newline.
-static void print_token(const char *s) {
-    while (*s) {
-        uint8_t c = (uint8_t)*s;
-        if (c == 0xC4 && ((uint8_t)s[1] & 0xC0) == 0x80) {
-            // U+0100..U+013F → original byte 0x00..0x3F
-            putchar((uint8_t)s[1] - 0x80);
-            s += 2;
-        } else if (c == 0xC5 && ((uint8_t)s[1] & 0xC0) == 0x80) {
-            // U+0140..U+017F → original byte 0x40..0x7F
-            putchar((uint8_t)s[1] - 0x80 + 0x40);
-            s += 2;
-        } else {
-            putchar(c);
-            s++;
-        }
-    }
-}
 
 int generate(TransformerContext *ctx, const Tokenizer *tok,
              int *prompt_tokens, int n_prompt, int max_tokens) {
@@ -599,19 +601,29 @@ int generate(TransformerContext *ctx, const Tokenizer *tok,
     absolute_time_t gen_start = get_absolute_time();
 
     for (pos = 0; pos < n_prompt + max_tokens; pos++) {
-        float *logits = forward(ctx, token, pos);
+        absolute_time_t tok_start = get_absolute_time();
 
-        if (!logits) {
-            printf("[forward returned NULL at pos %d]\n", pos);
+        int next_token = forward(ctx, token, pos);
+
+        int64_t tok_ms = absolute_time_diff_us(tok_start, get_absolute_time()) / 1000;
+
+        if (next_token < 0) {
+            printf("[forward failed at pos %d]\n", pos);
             break;
         }
 
         if (pos < n_prompt - 1) {
             token = prompt_tokens[pos + 1];
         } else {
-            token = argmax(logits, ctx->config.vocab_size);
+            token = next_token;
             tokens_generated++;
-            print_token(tokenizer_decode(tok, token));
+            // Print token ID (no on-device decoding for large-vocab models)
+            if (tok && tok->vocab && token < tok->vocab_size) {
+                printf("%s", tok->vocab[token]);
+            } else {
+                printf("[%d]", token);
+            }
+            printf(" (%lld ms) ", (long long)tok_ms);
         }
     }
 

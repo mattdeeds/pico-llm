@@ -20,19 +20,25 @@ add_executable(pico_llm
 target_include_directories(pico_llm PRIVATE src)
 
 target_compile_definitions(pico_llm PRIVATE
-    D_MODEL=256
-    N_LAYERS=6
-    N_HEADS=4
-    N_KV_HEADS=4
-    VOCAB_SIZE=8192
-    HIDDEN_DIM=704
+    D_MODEL=1024
+    N_LAYERS=28
+    N_HEADS=16
+    N_KV_HEADS=8
+    VOCAB_SIZE=151936
+    HIDDEN_DIM=3072
     MAX_SEQ_LEN=512
     WEIGHT_BUF_SIZE=32768
+    HEAD_DIM=128
+    ROPE_THETA=1000000.0f
+    RMSNORM_EPS=1e-6f
 )
 
 # src/ must be on the SDIO library's include path so it finds sdio_rp2350_config.h
 # PRIVATE so the library itself sees the config during compilation (not just consumers)
 target_include_directories(sdio_rp2350 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+
+# Larger stack for Qwen3 forward pass VLAs (~6KB peak per layer iteration)
+set(PICO_STACK_SIZE 16384)
 
 target_compile_options(pico_llm PRIVATE -O2 -Wall -Wextra)
 
