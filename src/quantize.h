@@ -7,23 +7,20 @@
 extern "C" {
 #endif
 
-// Quantized matmul: out[rows] = (weights[rows][cols] @ x[cols]) * scale
-// Weights are int8, input is float (quantized internally), output is float
-void matmul_q8(float *out, const int8_t *weights, float w_scale,
-               const float *x, int rows, int cols);
-
-// Tiled matmul: process a tile of rows at a time from a weight buffer
-// out[tile_rows] += weights_tile[tile_rows][cols] @ x_q[cols]
-// Pure integer inner loop for SMLAL optimization
-void matmul_q8_tile(int32_t *acc, const int8_t *weights, const int8_t *x_q,
-                    int tile_rows, int cols);
-
 // Quantize a float vector to int8, returns the scale factor used
 float quantize_vec(int8_t *out, const float *in, int size);
 
-// Dequantize int32 accumulators to float with combined scale
-void dequant_acc(float *out, const int32_t *acc, float w_scale, float x_scale,
-                 int size);
+// Q1_0_g128 tiled matmul: weights are Q1_0_g128 blocks (18 bytes per 128 values).
+// For each row: (cols/128) blocks of [float16 scale + 16 sign bytes].
+// In each sign byte, bit k selects weight at position (j*8 + k) within the block:
+//   bit = 1 → +scale, bit = 0 → -scale.
+// Inner loop: sign × int8 → int32, multiplied per-block by the float16 scale.
+// Output is float (per-block dequantization is built-in).
+void matmul_q1_0_g128_tile(float *acc, const uint8_t *weights,
+                           const int8_t *x_q, int tile_rows, int cols);
+
+// Convert IEEE 754 float16 (half-precision) to float32
+float fp16_to_fp32(uint16_t h);
 
 #ifdef __cplusplus
 }

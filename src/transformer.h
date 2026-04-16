@@ -78,8 +78,8 @@ typedef struct {
     uint32_t vocab_end;       // end of vocab section = start of layer weights
     uint32_t layer_bytes;     // size of one layer's weights in bytes
     uint32_t final_norm_off;  // byte offset to final_norm
-    uint32_t wcls_off;        // byte offset to classifier weights
-    uint32_t wcls_scale_off;  // byte offset to wcls scale (for tied embedding dequant)
+    uint32_t wcls_off;        // byte offset to classifier weights (Q1_0_g128)
+    uint32_t wcls_end;        // byte offset past end of wcls data
     uint32_t kv_base_block;   // first SD block of KV cache region
 } ModelLayout;
 
@@ -109,17 +109,14 @@ typedef struct {
     // Final layer norm (small enough to keep in RAM)
     float *final_norm;    // [dim]
 
-    // Wcls scale for tied embedding dequantization
-    float wcls_scale;
-
     // Sampling parameters
     float temperature;          // 0 = greedy, > 0 = Gumbel-max sampling
     float repetition_penalty;   // 1.0 = no penalty, > 1.0 = penalize repeats
 } TransformerContext;
 
 // Compile-time RAM budget checks
-_Static_assert(D_MODEL * sizeof(float) <= 4096,
-    "d_model activation buffer exceeds 4KB");
+_Static_assert(D_MODEL * sizeof(float) <= 16384,
+    "d_model activation buffer exceeds 16KB");
 _Static_assert(WEIGHT_BUF_SIZE <= 32768,
     "weight buffer exceeds 32KB");
 
@@ -130,7 +127,7 @@ int generate(TransformerContext *ctx, const Tokenizer *tok,
              int *prompt_tokens, int n_prompt, int max_tokens);
 
 // Load a single token embedding from SD card into out[dim]
-// (tied embeddings: reads int8 from wcls section, dequantizes)
+// (tied embeddings: reads Q1_0_g128 row from wcls section, dequantizes per-block)
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out);
 
 // Weight stream functions
@@ -141,14 +138,16 @@ void ws_read_bytes(WeightStream *ws, void *out, uint32_t nbytes);
 void ws_drain(WeightStream *ws);
 void ws_resume(WeightStream *ws);
 
-// Tiled streaming matmul: reads rows*cols int8 weights + scale from stream
+// Q1_0_g128 tiled streaming matmul: reads Q1_0_g128 blocks from stream.
+// Each row is (cols/128) blocks of 18 bytes. Output is float (per-block
+// dequant built-in). Caller multiplies by x_scale afterward.
 void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols);
 
-// Streaming token sampling: processes classifier in chunks using Gumbel-max
-// trick for temperature sampling with repetition penalty. Returns token ID.
+// Streaming token sampling: processes Q1_0_g128 classifier in chunks using
+// Gumbel-max trick for temperature sampling with repetition penalty.
 int ws_sample_token(WeightStream *ws, const int8_t *x_q,
-                    float x_scale, float w_scale, int rows, int cols,
+                    float x_scale, int rows, int cols,
                     float temperature, float repetition_penalty,
                     const int *recent_tokens, int recent_count,
                     uint64_t *rng_state);

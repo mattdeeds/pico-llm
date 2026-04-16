@@ -7,6 +7,7 @@
 #include "hardware/dma.h"
 #include "transformer.h"
 #include "sdcard.h"
+#include "quantize.h"
 #include "tokenizer.h"
 
 // Static allocation for weight double-buffers (4-byte aligned for DMA)
@@ -23,22 +24,21 @@ static float v_buf[KV_DIM];
 static float att_buf[N_HEADS];
 static float hb_buf[HIDDEN_DIM];
 static float hb2_buf[HIDDEN_DIM];
-// No logits buffer — streaming argmax computes argmax without storing logits
 
 // Final layer norm stays in RAM
 static float final_norm_buf[D_MODEL];
 
-// Shared matmul accumulator for Core 1 compute
-// Needs to be large enough for: max(HIDDEN_DIM, Q_DIM, CHUNK_ROWS) int32 entries
-int32_t matmul_acc[HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM];
+// Shared matmul accumulator for Core 1 compute (float for Q1_0_g128 per-block dequant)
+float matmul_acc[HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM];
 
 // Scratch buffer for SD reads during init (reuses weight_buf_a before prefetch starts)
 #define SCRATCH_BUF ((uint8_t *)weight_buf_a)
 #define SCRATCH_SIZE WEIGHT_BUF_SIZE
 
-// Token embedding read buffer: reads D_MODEL int8 bytes from wcls (tied embeddings)
-#define EMB_BYTES D_MODEL
-#define EMB_BLOCKS (((EMB_BYTES + 511) / 512) + 1)
+// Token embedding read buffer: reads one Q1_0_g128 row from wcls (tied embeddings)
+// Q1_0_g128 row bytes = (D_MODEL / 128) * 18
+#define EMB_Q1_BYTES ((D_MODEL / 128) * 18)
+#define EMB_BLOCKS (((EMB_Q1_BYTES + 511) / 512) + 1)
 static uint8_t emb_read_buf[EMB_BLOCKS * 512] __attribute__((aligned(4)));
 
 static void init_run_state(RunState *s) {
@@ -96,11 +96,9 @@ static bool load_config(Config *cfg) {
     return true;
 }
 
-// Scan vocab section on SD to find the end offset (= start of weight data).
-// Does NOT load vocab into RAM — vocab is too large for Qwen3 (151K tokens).
-// Returns the byte offset past the last token, or 0 on failure.
+// Scan vocab section to find the end offset (= start of weight data).
 static uint32_t scan_vocab_end(int vocab_size) {
-    uint32_t pos = sizeof(Config); // vocab starts right after header
+    uint32_t pos = sizeof(Config);
     int scanned = 0;
 
     while (scanned < vocab_size) {
@@ -127,7 +125,12 @@ static uint32_t scan_vocab_end(int vocab_size) {
     return pos;
 }
 
-// Compute all byte offsets into the V2 model file.
+// Q1_0_g128 row size in bytes: (cols / 128) blocks × 18 bytes per block
+static inline uint32_t q1_row_bytes(int cols) {
+    return (uint32_t)(cols / 128) * 18;
+}
+
+// Compute all byte offsets into the Q1_0_g128 model file.
 static void compute_layout(ModelLayout *layout, const Config *cfg) {
     int dim = cfg->dim;
     int head_dim = cfg->head_dim;
@@ -136,38 +139,51 @@ static void compute_layout(ModelLayout *layout, const Config *cfg) {
     int hidden = cfg->hidden_dim;
 
     uint32_t layer = 0;
-    layer += dim * 4;                   // attn_norm  [dim] float32
-    layer += head_dim * 4;              // q_norm     [head_dim] float32
-    layer += head_dim * 4;              // k_norm     [head_dim] float32
-    layer += q_dim * dim + 4;           // wq         [q_dim x dim] int8 + scale
-    layer += kv_dim * dim + 4;          // wk         [kv_dim x dim] int8 + scale
-    layer += kv_dim * dim + 4;          // wv         [kv_dim x dim] int8 + scale
-    layer += dim * q_dim + 4;           // wo         [dim x q_dim] int8 + scale
-    layer += dim * 4;                   // ffn_norm   [dim] float32
-    layer += hidden * dim + 4;          // w_gate     [hidden x dim] int8 + scale
-    layer += hidden * dim + 4;          // w_up       [hidden x dim] int8 + scale
-    layer += dim * hidden + 4;          // w_down     [dim x hidden] int8 + scale
+    layer += dim * 4;                                // attn_norm  [dim] float32
+    layer += head_dim * 4;                           // q_norm     [head_dim] float32
+    layer += head_dim * 4;                           // k_norm     [head_dim] float32
+    layer += (uint32_t)q_dim * q1_row_bytes(dim);    // wq   Q1 [q_dim rows]
+    layer += (uint32_t)kv_dim * q1_row_bytes(dim);   // wk   Q1 [kv_dim rows]
+    layer += (uint32_t)kv_dim * q1_row_bytes(dim);   // wv   Q1 [kv_dim rows]
+    layer += (uint32_t)dim * q1_row_bytes(q_dim);    // wo   Q1 [dim rows]
+    layer += dim * 4;                                // ffn_norm  [dim] float32
+    layer += (uint32_t)hidden * q1_row_bytes(dim);   // w_gate Q1
+    layer += (uint32_t)hidden * q1_row_bytes(dim);   // w_up   Q1
+    layer += (uint32_t)dim * q1_row_bytes(hidden);   // w_down Q1
     layout->layer_bytes = layer;
 
     uint32_t after_layers = layout->vocab_end + (uint32_t)cfg->n_layers * layer;
     layout->final_norm_off = after_layers;
     layout->wcls_off = layout->final_norm_off + dim * 4;
-    // wcls scale is at the end of wcls data: wcls_off + vocab_size * dim
-    layout->wcls_scale_off = layout->wcls_off + (uint32_t)cfg->vocab_size * dim;
+    layout->wcls_end = layout->wcls_off
+                       + (uint32_t)cfg->vocab_size * q1_row_bytes(dim);
 }
 
-// Load a single token embedding from SD (tied embeddings: read int8 from wcls, dequantize).
+// Load a single token embedding from SD.
+// Tied embeddings: read one Q1_0_g128 row from wcls, dequantize per-block to float32.
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out) {
-    uint32_t byte_off = ctx->layout.wcls_off
-                        + (uint32_t)token_id * D_MODEL; // int8 data, 1 byte per element
-    int8_t emb_int8[D_MODEL];
-    if (!sd_read_bytes(byte_off, emb_int8, D_MODEL, emb_read_buf, sizeof(emb_read_buf)))
+    uint32_t row_bytes = q1_row_bytes(D_MODEL);
+    uint32_t byte_off = ctx->layout.wcls_off + (uint32_t)token_id * row_bytes;
+
+    uint8_t q1_row[EMB_Q1_BYTES];
+    if (!sd_read_bytes(byte_off, q1_row, row_bytes, emb_read_buf, sizeof(emb_read_buf)))
         return false;
 
-    // Dequantize: float = int8 * scale
-    float scale = ctx->wcls_scale;
-    for (int i = 0; i < D_MODEL; i++) {
-        out[i] = (float)emb_int8[i] * scale;
+    // Dequantize Q1_0_g128 blocks → float32
+    // Per block: 2B fp16 scale + 16 sign bytes. Bit k of byte j → weight j*8 + k.
+    int blocks = D_MODEL / 128;
+    const uint8_t *p = q1_row;
+    for (int b = 0; b < blocks; b++) {
+        float d = fp16_to_fp32((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+        const uint8_t *qs = p + 2;
+        int col_base = b * 128;
+        for (int j = 0; j < 16; j++) {
+            uint8_t m = qs[j];
+            for (int k = 0; k < 8; k++) {
+                out[col_base + j * 8 + k] = (m & (1u << k)) ? d : -d;
+            }
+        }
+        p += 18;
     }
     return true;
 }
@@ -179,17 +195,16 @@ bool load_token_embedding(const TransformerContext *ctx, int token_id, float *ou
 int main(void) {
     stdio_init_all();
 
-    // Wait for USB CDC to enumerate so we don't lose boot output
     while (!stdio_usb_connected()) {
         sleep_ms(100);
     }
     sleep_ms(200);
 
     printf("\n");
-    printf("=========================\n");
-    printf("  pico-llm v0.2 (Qwen3)\n");
+    printf("================================\n");
+    printf("  pico-llm v0.4 (Bonsai-1.7B Q1_0_g128)\n");
     printf("  Bare metal LLM on RP2350\n");
-    printf("=========================\n\n");
+    printf("================================\n\n");
 
     // --- Initialize SD card ---
     printf("Initializing SD card...\n");
@@ -233,15 +248,15 @@ int main(void) {
     }
     compute_layout(&ctx.layout, &ctx.config);
 
-    // KV cache lives on SD after wcls data + scale
-    uint32_t model_end = ctx.layout.wcls_scale_off + sizeof(float);
-    ctx.layout.kv_base_block = (model_end + 511) / 512;
+    // KV cache lives on SD after wcls data
+    ctx.layout.kv_base_block = (ctx.layout.wcls_end + 511) / 512;
 
     printf("Model layout (byte offsets on SD):\n");
     printf("  weights start:  %lu\n", (unsigned long)ctx.layout.vocab_end);
     printf("  layer size:     %lu bytes\n", (unsigned long)ctx.layout.layer_bytes);
     printf("  final_norm:     %lu\n", (unsigned long)ctx.layout.final_norm_off);
     printf("  classifier:     %lu\n", (unsigned long)ctx.layout.wcls_off);
+    printf("  wcls_end:       %lu\n", (unsigned long)ctx.layout.wcls_end);
     printf("  kv_cache:       block %lu\n", (unsigned long)ctx.layout.kv_base_block);
     printf("\n");
 
@@ -254,14 +269,6 @@ int main(void) {
         goto halt;
     }
 
-    // --- Load wcls scale for tied embedding dequantization ---
-    if (!sd_read_bytes(ctx.layout.wcls_scale_off, &ctx.wcls_scale,
-                       sizeof(float), SCRATCH_BUF, SCRATCH_SIZE)) {
-        printf("FATAL: Could not load wcls scale from SD.\n");
-        goto halt;
-    }
-    printf("Wcls scale: %f\n", ctx.wcls_scale);
-
     // --- Initialize run state ---
     init_run_state(&ctx.state);
     ctx.state.rng_state = (uint64_t)time_us_64();
@@ -271,7 +278,7 @@ int main(void) {
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
     multicore_launch_core1(compute_worker);
-    printf("Weight streaming ready (dual-core).\n\n");
+    printf("Weight streaming ready (dual-core, Q1_0_g128).\n\n");
 
     // --- Print RAM usage ---
     printf("RAM usage:\n");
@@ -287,7 +294,7 @@ int main(void) {
     printf("  Matmul acc:     %lu bytes\n", (unsigned long)sizeof(matmul_acc));
     printf("\n");
 
-    printf("pico-llm ready (Qwen3-0.6B). No on-device tokenizer.\n");
+    printf("pico-llm ready (Bonsai-1.7B Q1_0_g128). No on-device tokenizer.\n");
     printf("  temperature=%.2f  repetition_penalty=%.2f\n",
            ctx.temperature, ctx.repetition_penalty);
     printf("Commands: /temp N, /rep N, /greedy\n");
@@ -297,7 +304,6 @@ int main(void) {
     while (1) {
         printf("> ");
 
-        // Read a line from USB serial
         char input[512];
         int len = 0;
         while (len < (int)sizeof(input) - 1) {
@@ -352,11 +358,9 @@ int main(void) {
             if (*p == ',') p++;
         }
 
-        // Reset recent token history for each new prompt
         ctx.state.recent_count = 0;
 
         printf("[%d prompt tokens] ", n_prompt);
-
         generate(&ctx, NULL, tokens, n_prompt, 64);
         printf("\n");
     }

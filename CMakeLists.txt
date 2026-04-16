@@ -20,12 +20,12 @@ add_executable(pico_llm
 target_include_directories(pico_llm PRIVATE src)
 
 target_compile_definitions(pico_llm PRIVATE
-    D_MODEL=1024
+    D_MODEL=2048
     N_LAYERS=28
     N_HEADS=16
     N_KV_HEADS=8
-    VOCAB_SIZE=151936
-    HIDDEN_DIM=3072
+    VOCAB_SIZE=151669
+    HIDDEN_DIM=6144
     MAX_SEQ_LEN=512
     WEIGHT_BUF_SIZE=32768
     HEAD_DIM=128
@@ -37,8 +37,8 @@ target_compile_definitions(pico_llm PRIVATE
 # PRIVATE so the library itself sees the config during compilation (not just consumers)
 target_include_directories(sdio_rp2350 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 
-# Larger stack for Qwen3 forward pass VLAs (~6KB peak per layer iteration)
-set(PICO_STACK_SIZE 16384)
+# Stack for forward pass VLAs (attn_norm[2048]=8KB, hb_q[6144]=6KB)
+set(PICO_STACK_SIZE 32768)
 
 target_compile_options(pico_llm PRIVATE -O2 -Wall -Wextra)
 
