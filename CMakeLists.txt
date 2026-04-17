@@ -41,6 +41,8 @@ target_include_directories(sdio_rp2350 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 set(PICO_STACK_SIZE 32768)
 
 target_compile_options(pico_llm PRIVATE -O2 -Wall -Wextra)
+set_source_files_properties(src/quantize.c
+    PROPERTIES COMPILE_OPTIONS "-O3;-funroll-loops")
 
 target_link_libraries(pico_llm
     pico_stdlib
@@ -56,3 +58,5 @@ pico_enable_stdio_uart(pico_llm 0)
 pico_enable_stdio_usb(pico_llm 1)
 
 pico_add_extra_outputs(pico_llm)
+
+add_subdirectory(test)
