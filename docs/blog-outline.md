@@ -210,9 +210,29 @@ No OS, no frameworks, no GPU. Just C, an SD card, and a lot of streaming.
 
 - **232 MB** model on SD card (down from 570 MB for Qwen3-0.6B int8 — smaller *and* 3× more parameters)
 - **~230 KB RAM** used — the smallest footprint of any Qwen3 model we've run
-- **~63 s/tok** on hardware — first sub-minute token rate on a real open-source model
+- **~38 s/tok** on hardware after optimization — the fastest real-model token rate yet
 - Coherent English on the first prompt: "Hello world!" → "I'm a:\". I think that's all you'd need. Just let me know..." (base-model chatter, as expected)
-- The speed regime has flipped: for the first time, **compute is the bottleneck**, not SD I/O. 232 MB/tok at ~12.5 MB/s should be ~19 s of reads; we're at 63 s, so compute (~1.7B multiply-adds per token on a 150 MHz Cortex-M33) now dominates.
+- The speed regime has flipped: for the first time, **compute is the bottleneck**, not SD I/O. 232 MB/tok at ~25 MB/s (50 MHz SDIO) should be ~9.3 s of reads; we're at 38 s, so compute (~1.7B multiply-adds per token on a 200 MHz Cortex-M33) still dominates even after optimization.
+
+### Optimization: 50 MHz SDIO and ARM DSP intrinsics (Apr 16-17)
+
+Two optimizations stacked for a combined **39% speedup** (62.7 → 38.1 s/tok):
+
+**1. 50 MHz high-speed SDIO** (25% speedup, 62.7 → 46.8 s/tok)
+- Issued CMD6 SWITCH_FUNC to put the SD card into SDR25/HS mode
+- Bumped GPIO drive strength 8 → 12 mA on CLK/CMD/DAT0-3
+- Pinned sysclk to 200 MHz for exact integer PIO divider (200/4 = 50 MHz)
+- Added multi-block smoke read after HS init with graceful 25 MHz fallback
+- Previous attempt (Apr 13) hit CRC errors — the drive strength bump fixed it
+
+**2. ARM DSP intrinsics in the matmul kernel** (19% speedup, 46.8 → 38.1 s/tok)
+- Benchmarked three kernel variants against baseline using DWT cycle counter
+- Winner: split-phase approach — tight `total` loop (no sign-byte dependency) + 2×-unrolled `pos` loop with GE-flag byte selection
+- Key DSP instructions: `SADD8`/`SEL` for nibble-indexed byte selection via GE flags, `SXTB16`/`SXTAB16`/`SADD16` for packed int16 horizontal sums
+- Inline ASM for `SXTAB16 Rd, Rn, Rm, ROR #8` — GCC doesn't fold the rotation operand into the instruction, wasting 4 instructions per sign byte
+- `-O3 -funroll-loops` for quantize.c (rest of firmware stays at -O2)
+- Result: **5.07 → 4.07 cycles/weight** (20% kernel speedup, measured via DWT)
+- Correctness verified: exact match with baseline kernel output
 
 ## 14. The Numbers
 
@@ -224,23 +244,24 @@ No OS, no frameworks, no GPU. Just C, an SD card, and a lot of streaming.
 | Layers | 6 | 28 | 36 | 28 |
 | Dimensions | 256 | 1024 | 2560 | 2048 |
 | Vocab | 8,192 | 151,936 | 151,936 | 151,669 |
-| Token rate | ~690 ms/tok | ~55 s/tok | ~3–6 min/tok | **~63 s/tok** |
+| Token rate | ~690 ms/tok | ~55 s/tok | ~3–6 min/tok | **~38 s/tok** |
 | RAM used | ~114 KB | ~150 KB | ~330 KB | ~230 KB |
 | SD reads/token | ~10 MB | ~570 MB | ~2.16 GB | ~232 MB |
+| SDIO speed | 25 MHz | 25 MHz | 25 MHz | **50 MHz** |
 | Bottleneck | SD I/O | SD I/O | SD I/O | **compute** |
 | Hardware cost | ~$5 (Pico 2 + SD) | same | same | same |
 
 ## 15. What's Next
 
 - **Bonsai-8B**: same Q1_0_g128 pipeline with bigger compile-time constants (dim=4096, hidden=12288, 36 layers, 32 heads). At ~1.15 GB on disk, still comfortably inside our SD budget — 4.8× more parameters than Bonsai-1.7B. The port is a few-line change.
-- **Compute is the new bottleneck**: Cortex-M33 at 150 MHz with no SIMD for 1-bit × int8. SIMD-ish tricks (nibble-parallel popcount via DSP instructions, or unrolled loop with precomputed `sum(x)` per 32-byte chunk) could claw back 2–3×.
-- **High-speed SDIO (50 MHz)**: now less urgent — SD is no longer the bottleneck for Bonsai — but still useful for Q4_0-style models.
-- **Activation quantization revisit**: we use int8 symmetric activations. For 1-bit weights, int4 activations might preserve accuracy while halving compute.
+- **Compute is still the bottleneck**: at 4.07 cycles/weight after DSP optimization, there's room to push further. The theoretical floor is ~2 cycles/weight (1 load + 1 ALU). Inline assembly for the full inner loop or int4 activation quantization could close the gap.
+- **Activation quantization revisit**: we use int8 symmetric activations. For 1-bit weights, int4 activations would halve the operand size — potentially faster per-weight with different packed-byte tricks.
+- **Overclock to 250+ MHz**: the RP2350 can be overclocked beyond 200 MHz. Linear clock speedup on a compute-bound kernel would directly reduce s/tok.
 
 ## 16. What I Learned
 
 - **You don't need the model in RAM** — you just need it in order. Sequential streaming makes the impossible possible.
-- **SD card I/O dominates — until it doesn't**: it was the bottleneck for everything through 4B Q4_0. At 1-bit weights, compute finally took over. Different regimes need different optimizations.
+- **SD card I/O dominates — until it doesn't**: it was the bottleneck for everything through 4B Q4_0. At 1-bit weights, compute finally took over. Each regime needs different optimizations: 50 MHz SDIO helped 25%, but ARM DSP intrinsics in the inner loop added another 19%. Stacked: 39% total.
 - **Quantization granularity matters**: per-tensor int8 was fine for 600M, 4B needed per-block Q4_0, and Bonsai showed that *training*-time quantization crushes *post-hoc* quantization on error (0.55 vs 9.57 max logit error).
 - **Training for the target beats adapting after the fact**: Bonsai's weights are 1-bit because they were trained to be — the "quantization" is lossless.
 - **The Gumbel-max trick is beautiful**: temperature sampling without storing logits, using a one-line mathematical identity.
