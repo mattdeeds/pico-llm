@@ -4,6 +4,7 @@
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "pico/multicore.h"
+#include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "transformer.h"
 #include "sdcard.h"
@@ -193,6 +194,10 @@ bool load_token_embedding(const TransformerContext *ctx, int token_id, float *ou
 // ============================================================================
 
 int main(void) {
+    // Pin sysclk to 200 MHz so SDIO PIO dividers are exact integers
+    // (200 MHz / 4 = 50.00 MHz HS). Must be called before stdio_init_all().
+    set_sys_clock_khz(200000, true);
+
     stdio_init_all();
 
     while (!stdio_usb_connected()) {

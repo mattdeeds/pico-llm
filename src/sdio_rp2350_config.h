@@ -21,7 +21,7 @@ static inline void sdio_log(const char *txt, uint32_t arg1, uint32_t arg2) {
 // GPIO function must match PIO block
 #define SDIO_GPIO_FUNC GPIO_FUNC_PIO1
 #define SDIO_GPIO_SLEW GPIO_SLEW_RATE_FAST
-#define SDIO_GPIO_DRIVE GPIO_DRIVE_STRENGTH_8MA
+#define SDIO_GPIO_DRIVE GPIO_DRIVE_STRENGTH_12MA
 
 // DMA channels
 #define SDIO_DMACH_A 4

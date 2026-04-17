@@ -1,6 +1,7 @@
 #include "sdcard.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "hardware/clocks.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -142,10 +143,10 @@ bool sdcard_init(void) {
     status = sd_cmd(ACMD6, 2, &reply);
     if (status != SDIO_OK) { printf("SDIO: ACMD6 fail\n"); return false; }
 
-    // High-speed mode (50 MHz) — disabled pending PCB signal integrity fix
-    // To re-enable: change SDIO_STANDARD to SDIO_HIGHSPEED and uncomment CMD6
-#if 0
     // CMD6: SWITCH_FUNC to SDR25 (50 MHz high-speed)
+    // Argument 0x80FFFF01 = set mode + group 1 function 1 (High-Speed).
+    // The card returns a 64-byte status block; byte 16 low nibble reports
+    // the function selected for group 1: 0x1 = HS accepted, 0xF = rejected.
     rp2350_sdio_mode_t speed_mode = SDIO_STANDARD;
     uint8_t cmd6_status[64] __attribute__((aligned(4)));
     status = rp2350_sdio_command_u32(CMD6, 0x80FFFF01, &reply, SDIO_FLAG_STOP_CLK);
@@ -160,21 +161,45 @@ bool sdcard_init(void) {
         rp2350_sdio_stop();
         if (status == SDIO_OK) {
             busy_wait_us_32(1000);
-            speed_mode = SDIO_HIGHSPEED;
+            uint8_t g1_selected = cmd6_status[16] & 0x0F;
+            if (g1_selected == 0x1) {
+                speed_mode = SDIO_HIGHSPEED;
+            } else {
+                printf("SDIO: card refused HS switch (g1=0x%x), staying at 25 MHz\n",
+                       g1_selected);
+            }
+        } else {
+            printf("SDIO: CMD6 status read failed, staying at 25 MHz\n");
         }
+    } else {
+        printf("SDIO: CMD6 command failed, staying at 25 MHz\n");
     }
+
     rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(speed_mode);
-#else
-    rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(SDIO_STANDARD);
-#endif
     rp2350_sdio_init(hs_timing);
 
     // Set block length to 512 for data transfers
     sd_cmd(CMD16, 512, &reply);
 
-    printf("SDIO init OK (%s, %s)\n",
+    // HS smoke test: apr-13 showed multi-block reads fail at 50 MHz while
+    // single-block reads pass. Do a 2-block CMD18 read of block 0; if it
+    // trips CRC, fall back cleanly to 25 MHz instead of bricking inference.
+    if (hs_timing.use_high_speed) {
+        uint8_t smoke[2 * 512] __attribute__((aligned(4)));
+        bool smoke_ok = sdcard_read_blocks(0, smoke, 2);
+        if (!smoke_ok) {
+            printf("SDIO: HS multi-block smoke read failed, falling back to 25 MHz\n");
+            hs_timing = rp2350_sdio_get_timing(SDIO_STANDARD);
+            rp2350_sdio_init(hs_timing);
+            sd_cmd(CMD16, 512, &reply);
+        }
+    }
+
+    uint32_t actual_khz = clock_get_hz(clk_sys) / hs_timing.data_clk_divider / 1000;
+    printf("SDIO init OK (%s, %s, actual = %lu kHz)\n",
            card_sdhc ? "SDHC" : "SD",
-           hs_timing.use_high_speed ? "high-speed 50MHz" : "standard 25MHz");
+           hs_timing.use_high_speed ? "high-speed 50MHz" : "standard 25MHz",
+           (unsigned long)actual_khz);
     return true;
 }
 
