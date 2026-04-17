@@ -400,7 +400,7 @@ int8_t *weightbuf_get(WeightBuf *wb) {
 // Shared state — set by Core 0 before dispatching chunks
 typedef struct {
     const int8_t *x_q;   // quantized input vector (int8 activations)
-    float *acc;           // float accumulator (Q1_0_g128 has per-block dequant)
+    float *acc;           // float accumulator (per-block dequant)
     int cols;             // matmul column count
     int rows_done;        // rows accumulated so far
 } ComputeState;
@@ -412,9 +412,9 @@ void compute_worker(void) {
         uint32_t weights_ptr = multicore_fifo_pop_blocking();
         uint32_t n_rows = multicore_fifo_pop_blocking();
 
-        matmul_q1_0_g128_tile(g_compute.acc + g_compute.rows_done,
-                              (const uint8_t *)weights_ptr,
-                              g_compute.x_q, (int)n_rows, g_compute.cols);
+        matmul_q4_0_tile(g_compute.acc + g_compute.rows_done,
+                         (const uint8_t *)weights_ptr,
+                         g_compute.x_q, (int)n_rows, g_compute.cols);
         g_compute.rows_done += (int)n_rows;
 
         multicore_fifo_push_blocking(1);

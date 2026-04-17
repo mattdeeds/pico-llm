@@ -201,7 +201,37 @@ void matmul_q1_0_g128_tile(float *acc, const uint8_t *weights,
 #endif
 }
 
-// (LUTs defined above, before matmul_q1_0_g128_tile)
+// ============================================================================
+// Q4_0 tiled matmul
+// ============================================================================
+
+void matmul_q4_0_tile(float *acc, const uint8_t *weights,
+                      const int8_t *x_q, int tile_rows, int cols) {
+    int blocks_per_row = cols / 32;
+    int row_bytes = blocks_per_row * 18;
+
+    for (int i = 0; i < tile_rows; i++) {
+        float row_sum = 0.0f;
+        const uint8_t *row = weights + i * row_bytes;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            float d = fp16_to_fp32((uint16_t)row[0] | ((uint16_t)row[1] << 8));
+            const uint8_t *qs = row + 2;
+            const int8_t *xb = x_q + b * 32;
+
+            int32_t sum = 0;
+            for (int j = 0; j < 16; j++) {
+                uint8_t qb = qs[j];
+                sum += ((int)(qb & 0xF) - 8) * (int)xb[j];
+                sum += ((int)(qb >> 4) - 8) * (int)xb[j + 16];
+            }
+
+            row_sum += d * (float)sum;
+            row += 18;
+        }
+        acc[i] = row_sum;
+    }
+}
 
 // ============================================================================
 // Variant A: Branchless LUT + word loads (pure C, no intrinsics)

@@ -29,17 +29,17 @@ static float hb2_buf[HIDDEN_DIM];
 // Final layer norm stays in RAM
 static float final_norm_buf[D_MODEL];
 
-// Shared matmul accumulator for Core 1 compute (float for Q1_0_g128 per-block dequant)
+// Shared matmul accumulator for Core 1 compute (float for per-block dequant)
 float matmul_acc[HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM];
 
 // Scratch buffer for SD reads during init (reuses weight_buf_a before prefetch starts)
 #define SCRATCH_BUF ((uint8_t *)weight_buf_a)
 #define SCRATCH_SIZE WEIGHT_BUF_SIZE
 
-// Token embedding read buffer: reads one Q1_0_g128 row from wcls (tied embeddings)
-// Q1_0_g128 row bytes = (D_MODEL / 128) * 18
-#define EMB_Q1_BYTES ((D_MODEL / 128) * 18)
-#define EMB_BLOCKS (((EMB_Q1_BYTES + 511) / 512) + 1)
+// Token embedding read buffer: reads one Q4_0 row from wcls (tied embeddings)
+// Q4_0 row bytes = (D_MODEL / 32) * 18
+#define EMB_Q4_BYTES ((D_MODEL / 32) * 18)
+#define EMB_BLOCKS (((EMB_Q4_BYTES + 511) / 512) + 1)
 static uint8_t emb_read_buf[EMB_BLOCKS * 512] __attribute__((aligned(4)));
 
 static void init_run_state(RunState *s) {
@@ -126,12 +126,12 @@ static uint32_t scan_vocab_end(int vocab_size) {
     return pos;
 }
 
-// Q1_0_g128 row size in bytes: (cols / 128) blocks × 18 bytes per block
-static inline uint32_t q1_row_bytes(int cols) {
-    return (uint32_t)(cols / 128) * 18;
+// Q4_0 row size in bytes: (cols / 32) blocks × 18 bytes per block
+static inline uint32_t q4_row_bytes(int cols) {
+    return (uint32_t)(cols / 32) * 18;
 }
 
-// Compute all byte offsets into the Q1_0_g128 model file.
+// Compute all byte offsets into the Q4_0 model file.
 static void compute_layout(ModelLayout *layout, const Config *cfg) {
     int dim = cfg->dim;
     int head_dim = cfg->head_dim;
@@ -143,46 +143,46 @@ static void compute_layout(ModelLayout *layout, const Config *cfg) {
     layer += dim * 4;                                // attn_norm  [dim] float32
     layer += head_dim * 4;                           // q_norm     [head_dim] float32
     layer += head_dim * 4;                           // k_norm     [head_dim] float32
-    layer += (uint32_t)q_dim * q1_row_bytes(dim);    // wq   Q1 [q_dim rows]
-    layer += (uint32_t)kv_dim * q1_row_bytes(dim);   // wk   Q1 [kv_dim rows]
-    layer += (uint32_t)kv_dim * q1_row_bytes(dim);   // wv   Q1 [kv_dim rows]
-    layer += (uint32_t)dim * q1_row_bytes(q_dim);    // wo   Q1 [dim rows]
+    layer += (uint32_t)q_dim * q4_row_bytes(dim);    // wq   Q4 [q_dim rows]
+    layer += (uint32_t)kv_dim * q4_row_bytes(dim);   // wk   Q4 [kv_dim rows]
+    layer += (uint32_t)kv_dim * q4_row_bytes(dim);   // wv   Q4 [kv_dim rows]
+    layer += (uint32_t)dim * q4_row_bytes(q_dim);    // wo   Q4 [dim rows]
     layer += dim * 4;                                // ffn_norm  [dim] float32
-    layer += (uint32_t)hidden * q1_row_bytes(dim);   // w_gate Q1
-    layer += (uint32_t)hidden * q1_row_bytes(dim);   // w_up   Q1
-    layer += (uint32_t)dim * q1_row_bytes(hidden);   // w_down Q1
+    layer += (uint32_t)hidden * q4_row_bytes(dim);   // w_gate Q4
+    layer += (uint32_t)hidden * q4_row_bytes(dim);   // w_up   Q4
+    layer += (uint32_t)dim * q4_row_bytes(hidden);   // w_down Q4
     layout->layer_bytes = layer;
 
     uint32_t after_layers = layout->vocab_end + (uint32_t)cfg->n_layers * layer;
     layout->final_norm_off = after_layers;
     layout->wcls_off = layout->final_norm_off + dim * 4;
     layout->wcls_end = layout->wcls_off
-                       + (uint32_t)cfg->vocab_size * q1_row_bytes(dim);
+                       + (uint32_t)cfg->vocab_size * q4_row_bytes(dim);
 }
 
 // Load a single token embedding from SD.
-// Tied embeddings: read one Q1_0_g128 row from wcls, dequantize per-block to float32.
+// Tied embeddings: read one Q4_0 row from wcls, dequantize per-block to float32.
 bool load_token_embedding(const TransformerContext *ctx, int token_id, float *out) {
-    uint32_t row_bytes = q1_row_bytes(D_MODEL);
+    uint32_t row_bytes = q4_row_bytes(D_MODEL);
     uint32_t byte_off = ctx->layout.wcls_off + (uint32_t)token_id * row_bytes;
 
-    uint8_t q1_row[EMB_Q1_BYTES];
-    if (!sd_read_bytes(byte_off, q1_row, row_bytes, emb_read_buf, sizeof(emb_read_buf)))
+    uint8_t q4_row[EMB_Q4_BYTES];
+    if (!sd_read_bytes(byte_off, q4_row, row_bytes, emb_read_buf, sizeof(emb_read_buf)))
         return false;
 
-    // Dequantize Q1_0_g128 blocks → float32
-    // Per block: 2B fp16 scale + 16 sign bytes. Bit k of byte j → weight j*8 + k.
-    int blocks = D_MODEL / 128;
-    const uint8_t *p = q1_row;
+    // Dequantize Q4_0 blocks → float32
+    // Per block: 2B fp16 scale + 16 packed nibble bytes → 32 float values.
+    // qs[j] low nibble = weight at position j, high nibble = weight at j+16.
+    int blocks = D_MODEL / 32;
+    const uint8_t *p = q4_row;
     for (int b = 0; b < blocks; b++) {
         float d = fp16_to_fp32((uint16_t)p[0] | ((uint16_t)p[1] << 8));
         const uint8_t *qs = p + 2;
-        int col_base = b * 128;
+        int col_base = b * 32;
         for (int j = 0; j < 16; j++) {
-            uint8_t m = qs[j];
-            for (int k = 0; k < 8; k++) {
-                out[col_base + j * 8 + k] = (m & (1u << k)) ? d : -d;
-            }
+            uint8_t qb = qs[j];
+            out[col_base + j]      = ((int)(qb & 0xF) - 8) * d;
+            out[col_base + j + 16] = ((int)(qb >> 4) - 8) * d;
         }
         p += 18;
     }
@@ -207,7 +207,7 @@ int main(void) {
 
     printf("\n");
     printf("================================\n");
-    printf("  pico-llm v0.4 (Bonsai-1.7B Q1_0_g128)\n");
+    printf("  pico-llm v0.5 (Qwen3-0.6B Q4_0)\n");
     printf("  Bare metal LLM on RP2350\n");
     printf("================================\n\n");
 
@@ -274,6 +274,11 @@ int main(void) {
         goto halt;
     }
 
+    // Switch to 250 MHz now that SD init is done at 200 MHz.
+    // SDIO driver auto-adjusts PIO divider (250/5 = 50 MHz HS).
+    set_sys_clock_khz(250000, true);
+    printf("System clock: 250 MHz\n");
+
     // --- Initialize run state ---
     init_run_state(&ctx.state);
     ctx.state.rng_state = (uint64_t)time_us_64();
@@ -283,7 +288,7 @@ int main(void) {
     weightbuf_init(&wb, weight_buf_a, weight_buf_b, WEIGHT_BUF_SIZE);
     ctx.wb = &wb;
     multicore_launch_core1(compute_worker);
-    printf("Weight streaming ready (dual-core, Q1_0_g128).\n\n");
+    printf("Weight streaming ready (dual-core, Q4_0).\n\n");
 
     // --- Print RAM usage ---
     printf("RAM usage:\n");
@@ -299,7 +304,7 @@ int main(void) {
     printf("  Matmul acc:     %lu bytes\n", (unsigned long)sizeof(matmul_acc));
     printf("\n");
 
-    printf("pico-llm ready (Bonsai-1.7B Q1_0_g128). No on-device tokenizer.\n");
+    printf("pico-llm ready (Qwen3-0.6B Q4_0). No on-device tokenizer.\n");
     printf("  temperature=%.2f  repetition_penalty=%.2f\n",
            ctx.temperature, ctx.repetition_penalty);
     printf("Commands: /temp N, /rep N, /greedy\n");

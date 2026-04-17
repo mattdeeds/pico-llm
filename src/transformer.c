@@ -12,20 +12,20 @@
 // Shared state for Core 1 compute worker (defined in sdcard.cpp)
 typedef struct {
     const int8_t *x_q;
-    float *acc;         // float output (Q1_0_g128 has per-block dequant)
+    float *acc;         // float output (per-block dequant)
     int cols;
     int rows_done;
 } ComputeState;
 extern ComputeState g_compute;
 
-// Shared matmul accumulator (defined in main.c, float for Q1_0_g128)
+// Shared matmul accumulator (defined in main.c)
 extern float matmul_acc[];
 
-// Q1_0_g128 row size in bytes: (cols / 128) blocks × 18 bytes per block
-#define Q1_ROW_BYTES(cols) (((cols) / 128) * 18)
+// Q4_0 row size in bytes: (cols / 32) blocks × 18 bytes per block
+#define Q4_ROW_BYTES(cols) (((cols) / 32) * 18)
 
-// Max Q1_0_g128 row bytes for any matmul (for row_tmp VLA)
-#define MAX_Q1_ROW_BYTES (Q1_ROW_BYTES(HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM))
+// Max Q4_0 row bytes for any matmul (for row_tmp VLA)
+#define MAX_Q4_ROW_BYTES (Q4_ROW_BYTES(HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM))
 
 // ============================================================================
 // Math primitives
@@ -261,8 +261,8 @@ void ws_resume(WeightStream *ws) {
 
 void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
                      float x_scale, int rows, int cols) {
-    uint8_t row_tmp[MAX_Q1_ROW_BYTES];
-    int row_bytes = Q1_ROW_BYTES(cols);
+    uint8_t row_tmp[MAX_Q4_ROW_BYTES];
+    int row_bytes = Q4_ROW_BYTES(cols);
 
     // Set up shared state for Core 1 compute worker
     g_compute.x_q = x_q;
@@ -295,8 +295,8 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
         } else {
             // Row spans buffer boundary — read into temp and process on Core 0
             ws_read_bytes(ws, row_tmp, row_bytes);
-            matmul_q1_0_g128_tile(matmul_acc + g_compute.rows_done,
-                                  row_tmp, x_q, 1, cols);
+            matmul_q4_0_tile(matmul_acc + g_compute.rows_done,
+                             row_tmp, x_q, 1, cols);
             g_compute.rows_done++;
             rows_sent++;
         }
@@ -306,7 +306,7 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
         multicore_fifo_pop_blocking();
     }
 
-    // Q1_0_g128 matmul output is already dequantized per-block — just apply x_scale
+    // Q4_0 matmul output is already dequantized per-block — just apply x_scale
     for (int i = 0; i < rows; i++) {
         out[i] = matmul_acc[i] * x_scale;
     }
@@ -351,8 +351,8 @@ int ws_sample_token(WeightStream *ws, const int8_t *x_q,
                     float temperature, float repetition_penalty,
                     const int *recent_tokens, int recent_count,
                     uint64_t *rng_state) {
-    uint8_t row_tmp[Q1_ROW_BYTES(D_MODEL)];
-    int row_bytes = Q1_ROW_BYTES(cols);
+    uint8_t row_tmp[Q4_ROW_BYTES(D_MODEL)];
+    int row_bytes = Q4_ROW_BYTES(cols);
     int best_token = 0;
     float best_score = -1e30f;
 
@@ -391,8 +391,8 @@ int ws_sample_token(WeightStream *ws, const int8_t *x_q,
                 chunk_sent += tile;
             } else {
                 ws_read_bytes(ws, row_tmp, row_bytes);
-                matmul_q1_0_g128_tile(matmul_acc + g_compute.rows_done,
-                                      row_tmp, x_q, 1, cols);
+                matmul_q4_0_tile(matmul_acc + g_compute.rows_done,
+                                 row_tmp, x_q, 1, cols);
                 g_compute.rows_done++;
                 chunk_sent++;
             }
@@ -403,7 +403,7 @@ int ws_sample_token(WeightStream *ws, const int8_t *x_q,
         }
 
         // Score each token in this chunk
-        // Q1_0_g128 matmul output is already per-block dequantized, just apply x_scale
+        // Q4_0 matmul output is already per-block dequantized, just apply x_scale
         for (int i = 0; i < chunk; i++) {
             float logit = matmul_acc[i] * x_scale;
 
@@ -529,7 +529,7 @@ int forward(TransformerContext *ctx, int token, int pos) {
     int kv_dim = cfg->n_kv_heads * head_dim;
     int hidden_dim = cfg->hidden_dim;
 
-    // 1. Load token embedding (tied: Q1_0_g128 row from wcls, dequantized)
+    // 1. Load token embedding (tied: Q4_0 row from wcls, dequantized)
     if (!load_token_embedding(ctx, token, s->x))
         return -1;
 
@@ -624,8 +624,8 @@ int forward(TransformerContext *ctx, int token, int pos) {
     // Final norm (weights already in RAM)
     rmsnorm(s->x, s->x, ctx->final_norm, dim);
 
-    // Classifier: streaming sample over wcls (Q1_0_g128)
-    uint32_t wcls_bytes = (uint32_t)cfg->vocab_size * Q1_ROW_BYTES(dim);
+    // Classifier: streaming sample over wcls (Q4_0)
+    uint32_t wcls_bytes = (uint32_t)cfg->vocab_size * Q4_ROW_BYTES(dim);
     WeightStream ws;
     ws_init(&ws, ctx->wb, ctx->layout.wcls_off, wcls_bytes);
 

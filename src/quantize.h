@@ -19,6 +19,14 @@ float quantize_vec(int8_t *out, const float *in, int size);
 void matmul_q1_0_g128_tile(float *acc, const uint8_t *weights,
                            const int8_t *x_q, int tile_rows, int cols);
 
+// Q4_0 tiled matmul: weights are Q4_0 blocks (18 bytes per 32 values).
+// For each row: (cols/32) blocks of [float16 scale + 16 packed nibble bytes].
+// Nibble packing: qs[j] low nibble = weight[j], high nibble = weight[j+16].
+// Dequant: weight_value = (nibble - 8) * scale.
+// Inner loop: int4×int8 → int32, multiplied per-block by the float16 scale.
+void matmul_q4_0_tile(float *acc, const uint8_t *weights,
+                      const int8_t *x_q, int tile_rows, int cols);
+
 // Variant kernels for benchmarking (same signature as matmul_q1_0_g128_tile)
 void matmul_q1_0_g128_tile_lut(float *acc, const uint8_t *weights,
                                 const int8_t *x_q, int tile_rows, int cols);

@@ -20,12 +20,12 @@ add_executable(pico_llm
 target_include_directories(pico_llm PRIVATE src)
 
 target_compile_definitions(pico_llm PRIVATE
-    D_MODEL=2048
+    D_MODEL=1024
     N_LAYERS=28
     N_HEADS=16
     N_KV_HEADS=8
-    VOCAB_SIZE=151669
-    HIDDEN_DIM=6144
+    VOCAB_SIZE=151936
+    HIDDEN_DIM=3072
     MAX_SEQ_LEN=512
     WEIGHT_BUF_SIZE=32768
     HEAD_DIM=128
