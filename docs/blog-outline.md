@@ -2,7 +2,7 @@
 
 ## Hook
 
-A climbing-the-ladder story: starting from Andrej Karpathy's llama2.c as inspiration, I built a bare-metal LLM inference engine for the RP2350 (dual Cortex-M33, 520 KB RAM) and progressively scaled up — first a custom 9M parameter toy, then Qwen3-0.6B (a real open-source model), then Qwen3-4B-Thinking (a reasoning-tuned 4B). At each step a new wall appeared. The last climb was sideways: a natively-trained 1-bit model (Bonsai-1.7B at 1.125 bits/weight) that gets back to sub-minute tokens without sacrificing capability.
+A climbing-the-ladder story: starting from Andrej Karpathy's llama2.c as inspiration, I built a bare-metal LLM inference engine for the RP2350 (dual Cortex-M33, 520 KB RAM) and progressively scaled up — first a custom 9M parameter toy, then Qwen3-0.6B (a real open-source model), then Qwen3-4B-Thinking (a reasoning-tuned 4B), then a natively-trained 1-bit model (Bonsai-1.7B). At each step a new wall appeared. The plot twist: the fastest result came from going *back* to the smallest real model with better quantization and an overclocked chip — 15.5 seconds per token, 2.5× faster than the 1-bit model, with better output quality.
 
 No OS, no frameworks, no GPU. Just C, an SD card, and a lot of streaming.
 
@@ -234,37 +234,71 @@ Two optimizations stacked for a combined **39% speedup** (62.7 → 38.1 s/tok):
 - Result: **5.07 → 4.07 cycles/weight** (20% kernel speedup, measured via DWT)
 - Correctness verified: exact match with baseline kernel output
 
-## 14. The Numbers
+## 14. The Plot Twist: Fewer Parameters, Faster and Smarter (Apr 17)
 
-| Metric | Custom 9M | Qwen3-0.6B int8 | Qwen3-4B Q4_0 | Bonsai-1.7B Q1_0_g128 |
-|--------|-----------|-----------------|----------------|-----------------------|
-| Parameters | 9M | 600M | 4B | 1.7B |
-| Bits/weight | 8 | 8 (per-tensor) | 4.5 (per-block 32) | 1.125 (per-block 128) |
-| Model size | 14.7 MB | 570 MB | 2.16 GB | 232 MB |
-| Layers | 6 | 28 | 36 | 28 |
-| Dimensions | 256 | 1024 | 2560 | 2048 |
-| Vocab | 8,192 | 151,936 | 151,936 | 151,669 |
-| Token rate | ~690 ms/tok | ~55 s/tok | ~3–6 min/tok | **~38 s/tok** |
-| RAM used | ~114 KB | ~150 KB | ~330 KB | ~230 KB |
-| SD reads/token | ~10 MB | ~570 MB | ~2.16 GB | ~232 MB |
-| SDIO speed | 25 MHz | 25 MHz | 25 MHz | **50 MHz** |
-| Bottleneck | SD I/O | SD I/O | SD I/O | **compute** |
-| Hardware cost | ~$5 (Pico 2 + SD) | same | same | same |
+- Bonsai-1.7B at 1-bit was our fastest — but was it our *best*?
+- Key realization: 1-bit quantization reduces storage but not compute. Bonsai has 2.8× more parameters than Qwen3-0.6B. Compute went *up* even though disk size went *down*.
+- The right question isn't "how many parameters can we cram in?" — it's "what's the best quality per second?"
+- Qwen3-0.6B at Q4_0: fewer parameters (less compute), moderate quantization (much better quality), 321 MB on disk (only 40% larger than Bonsai's 232 MB)
 
-## 15. What's Next
+### Bottleneck analysis
 
-- **Bonsai-8B**: same Q1_0_g128 pipeline with bigger compile-time constants (dim=4096, hidden=12288, 36 layers, 32 heads). At ~1.15 GB on disk, still comfortably inside our SD budget — 4.8× more parameters than Bonsai-1.7B. The port is a few-line change.
-- **Compute is still the bottleneck**: at 4.07 cycles/weight after DSP optimization, there's room to push further. The theoretical floor is ~2 cycles/weight (1 load + 1 ALU). Inline assembly for the full inner loop or int4 activation quantization could close the gap.
-- **Activation quantization revisit**: we use int8 symmetric activations. For 1-bit weights, int4 activations would halve the operand size — potentially faster per-weight with different packed-byte tricks.
-- **Overclock to 250+ MHz**: the RP2350 can be overclocked beyond 200 MHz. Linear clock speedup on a compute-bound kernel would directly reduce s/tok.
+| Model | Quant | I/O time | Compute time | Total | Quality |
+|---|---|---|---|---|---|
+| Bonsai-1.7B | Q1_0 | ~9s | ~29s | 38s | Worst |
+| Qwen3-0.6B | Q4_0 | ~16s | ~2.5s | 18.3s | Good |
+| Qwen3-0.6B | Q4_0 @ 250 MHz | ~16s | ~2s | **15.5s** | Good |
 
-## 16. What I Learned
+- Q4 matmul kernel: int4×int8 per block of 32, per-block fp16 scale. Same structural pattern as Q1_0 but with actual multiplies instead of conditional adds.
+- The Q4_0 export script already existed from the Qwen3-4B port — just pointed it at Qwen3-0.6B
+
+### 250 MHz overclock
+
+- RP2350 at 200 MHz → 250 MHz: 25% more clock cycles per second
+- Catch: 250 MHz at boot caused ACMD41 timeout during SD card init
+- Fix: init SD at 200 MHz, switch to 250 MHz after init. SDIO driver auto-adjusts PIO divider (250/5 = 50 MHz bus speed).
+- Linear speedup on the compute-bound portion: 18.3 → 15.5 s/tok
+
+### The twist
+
+- We climbed four rungs of model size (9M → 600M → 4B → 1.7B) chasing parameters
+- The fastest and most practical result came from going *back* to the smallest real model with better quantization and a faster clock
+- 15.5 s/tok with coherent, grammatical English — 2.5× faster than Bonsai, better output quality
+
+## 15. The Numbers
+
+| Metric | Custom 9M | Qwen3-0.6B int8 | Qwen3-4B Q4_0 | Bonsai-1.7B Q1_0 | Qwen3-0.6B Q4_0 |
+|--------|-----------|-----------------|----------------|------------------|-----------------|
+| Parameters | 9M | 600M | 4B | 1.7B | 600M |
+| Bits/weight | 8 | 8 (per-tensor) | 4.5 (per-block) | 1.125 (per-block) | 4.5 (per-block) |
+| Model size | 14.7 MB | 570 MB | 2.16 GB | 232 MB | 321 MB |
+| Layers | 6 | 28 | 36 | 28 | 28 |
+| Dimensions | 256 | 1024 | 2560 | 2048 | 1024 |
+| Vocab | 8,192 | 151,936 | 151,936 | 151,669 | 151,936 |
+| Token rate | ~690 ms | ~55 s | ~3–6 min | ~38 s | **~15.5 s** |
+| RAM used | ~114 KB | ~150 KB | ~330 KB | ~230 KB | ~140 KB |
+| SD reads/tok | ~10 MB | ~570 MB | ~2.16 GB | ~232 MB | ~321 MB |
+| SDIO speed | 25 MHz | 25 MHz | 25 MHz | 50 MHz | 50 MHz |
+| Sys clock | 150 MHz | 150 MHz | 150 MHz | 200 MHz | **250 MHz** |
+| Bottleneck | SD I/O | SD I/O | SD I/O | compute | SD I/O |
+| Hardware cost | ~$5 | same | same | same | same |
+
+## 16. What's Next
+
+- **DSP-optimized Q4_0 kernel**: the current Q4_0 kernel is scalar C. ARM DSP intrinsics (SMLAD for dual int16 multiply-accumulate) could cut cycles/weight significantly. We proved this works for Q1_0 — same approach applies.
+- **Dual-core compute**: Core 0 is mostly idle waiting for DMA during matmul. It could process half the tile rows in parallel with Core 1, for ~1.5× compute throughput.
+- **300 MHz overclock**: 250 MHz is stable. Some RP2350 chips run at 300 MHz — another 20% if the silicon cooperates.
+- **Bonsai-8B**: same Q1_0_g128 pipeline with bigger constants (dim=4096, 36 layers). ~1.15 GB on disk. The port is a few-line change, but at 1-bit the compute-bound regime makes it slower per token than Qwen3-0.6B Q4 despite better intelligence.
+- **Natively trained 1-bit small models**: if a BitNet-style model existed at 0.6B params, it could combine the compute advantage of fewer params with the I/O advantage of 1-bit storage. None exist yet in the open-weight ecosystem.
+
+## 17. What I Learned
 
 - **You don't need the model in RAM** — you just need it in order. Sequential streaming makes the impossible possible.
-- **SD card I/O dominates — until it doesn't**: it was the bottleneck for everything through 4B Q4_0. At 1-bit weights, compute finally took over. Each regime needs different optimizations: 50 MHz SDIO helped 25%, but ARM DSP intrinsics in the inner loop added another 19%. Stacked: 39% total.
+- **More parameters isn't always better**: Bonsai-1.7B at 1-bit had 3× more params than Qwen3-0.6B but was 2.5× slower and lower quality. The optimal is to minimize *both* storage and parameter count — moderate quantization on a small model beats extreme quantization on a large one.
+- **The bottleneck shifts**: SD I/O dominated for everything through 4B Q4_0. At 1-bit, compute took over. Switching back to Q4_0 on a smaller model made I/O the bottleneck again. Each regime needs different optimizations.
 - **Quantization granularity matters**: per-tensor int8 was fine for 600M, 4B needed per-block Q4_0, and Bonsai showed that *training*-time quantization crushes *post-hoc* quantization on error (0.55 vs 9.57 max logit error).
 - **Training for the target beats adapting after the fact**: Bonsai's weights are 1-bit because they were trained to be — the "quantization" is lossless.
 - **The Gumbel-max trick is beautiful**: temperature sampling without storing logits, using a one-line mathematical identity.
 - **Standard formats pay off**: reusing llama.cpp's block layouts (Q4_0, Q1_0_g128) meant firmware changes were ~50 lines per quantization scheme and we could validate against HuggingFace reference models.
 - **Hardware debugging is humbling**: one word in a CMakeLists.txt (`INTERFACE` vs `PRIVATE`) cost hours. The buffer boundary bug was three interrelated issues masking each other.
-- **Bare metal is freeing**: no OS overhead, no memory allocator surprises, every byte accounted for. 230 KB of RAM running a 1.7B parameter model — over 7000× its size.
+- **Bare metal is freeing**: no OS overhead, no memory allocator surprises, every byte accounted for. 140 KB of RAM running a 600M parameter model — over 4000× its size.
