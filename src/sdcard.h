@@ -12,6 +12,10 @@ extern "C" {
 // Pin assignments are in sdio_rp2350_config.h
 bool sdcard_init(void);
 
+// SDIO data clock divider chosen at init. The bus clock is sysclk / divider;
+// it is not recalculated if sysclk changes after init.
+int sdcard_data_clk_divider(void);
+
 // Read contiguous blocks from SD card into buffer
 // block_addr: 512-byte block number, count: number of blocks
 bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count);
@@ -46,6 +50,29 @@ int8_t *weightbuf_get(WeightBuf *wb);
 
 // Core 1 compute worker entry point (runs matmul_q8_tile on demand)
 void compute_worker(void);
+
+#ifdef PICO_LLM_PROFILE
+// Time Core 1 has spent in the matmul kernel since the last reset.
+// Written by Core 1; read and reset by Core 0 only while Core 1 is idle.
+extern uint64_t g_core1_busy_us;
+
+// SD error/retry counters, reset per token. Non-zero values mean the bus is
+// unhealthy -- the prime suspect when the bus runs past the high-speed spec.
+typedef struct {
+    uint32_t blk_retries;  // sdcard_read_blocks() CRC retries (KV cache path)
+    uint32_t pf_cmd_fail;  // weight prefetch: CMD18 rejected
+    uint32_t pf_rx_fail;   // weight prefetch: rx_start rejected
+    uint32_t pf_dma_err;   // weight prefetch: DMA completed with an error
+} sd_counters_t;
+extern sd_counters_t g_sd;
+
+// Weight-stream time split, reset per token. cmd18 + stop is the fixed cost
+// paid once per buffer; data is the part that scales with the bus clock.
+extern uint64_t g_pf_cmd18_us;
+extern uint64_t g_pf_data_us;
+extern uint64_t g_pf_stop_us;
+extern uint32_t g_pf_buffers;
+#endif
 
 #ifdef __cplusplus
 }

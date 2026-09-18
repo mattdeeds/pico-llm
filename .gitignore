@@ -13,7 +13,11 @@ build/
 ~*.lck
 *.bak
 fabrication-toolkit-options.json
-pico-llm-kicad/production/
+# KiCad's own local-history repos — nested git repos, not source
+.history/
+# Fab output we don't publish: Numbers duplicates bom.csv, backups are snapshots
+*.numbers
+**/production/backups/
 
 # Trained models and checkpoints
 models/
@@ -21,3 +25,7 @@ models/
 # Python
 __pycache__/
 *.pyc
+
+# Working draft of the blog post — carries editorial notes not meant to ship.
+# The published version lives at mattdeeds.com/writing/pico-llm.html
+docs/post-v2.md

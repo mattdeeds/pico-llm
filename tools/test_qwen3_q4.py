@@ -148,6 +148,14 @@ def softmax(x):
 # Forward pass
 # ---------------------------------------------------------------------------
 
+def read_config(binary_path):
+    """Read just the 8-int32 header from an exported binary."""
+    r = BinaryReader(binary_path)
+    keys = ("dim", "hidden_dim", "n_layers", "n_heads",
+            "n_kv_heads", "vocab_size", "max_seq_len", "head_dim")
+    return {k: r.read_int32() for k in keys}
+
+
 def forward_pass(binary_path, input_ids, rope_theta):
     r = BinaryReader(binary_path)
 
@@ -305,6 +313,37 @@ def main():
         ref_logits = hf_out.logits[0].numpy()
 
     print(f"Reference logits shape: {ref_logits.shape}")
+
+    # Guard: the defaults here are Qwen3-4B-specific (model name AND rope theta).
+    # Passing a 0.6B binary without overriding both silently compares it against
+    # the wrong reference model and produces meaningless agreement numbers.
+    # Check the binary's own header against the HF config before trusting anything.
+    bin_cfg = read_config(args.binary)
+    hf_cfg = hf_model.config
+    mismatches = []
+    for name, got, want in (
+        ("dim", bin_cfg["dim"], hf_cfg.hidden_size),
+        ("hidden_dim", bin_cfg["hidden_dim"], hf_cfg.intermediate_size),
+        ("n_layers", bin_cfg["n_layers"], hf_cfg.num_hidden_layers),
+        ("vocab_size", bin_cfg["vocab_size"], hf_cfg.vocab_size),
+    ):
+        if got != want:
+            mismatches.append(f"    {name}: binary={got} but {args.model_name}={want}")
+    if mismatches:
+        print("\nFATAL: binary does not match the reference model.\n"
+              + "\n".join(mismatches)
+              + f"\n\n  Pass --model-name (and --rope-theta) for the model this\n"
+                f"  binary was exported from. Defaults are for Qwen3-4B-Thinking-2507\n"
+                f"  (--rope-theta 5000000); Qwen3-0.6B needs --rope-theta 1000000.")
+        raise SystemExit(1)
+
+    ref_theta = getattr(hf_cfg, "rope_theta", None)
+    if ref_theta is not None and float(ref_theta) != float(args.rope_theta):
+        print(f"\nFATAL: --rope-theta {args.rope_theta:g} does not match "
+              f"{args.model_name} (rope_theta={float(ref_theta):g}).\n"
+              f"  RoPE theta changes every position-dependent result, so the\n"
+              f"  comparison would be meaningless. Pass --rope-theta {float(ref_theta):g}.")
+        raise SystemExit(1)
 
     print(f"\nRunning Q4_0 NumPy forward pass on {args.binary}...")
     test_logits = forward_pass(args.binary, input_ids, args.rope_theta)

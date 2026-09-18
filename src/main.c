@@ -36,9 +36,8 @@ float matmul_acc[HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM];
 #define SCRATCH_BUF ((uint8_t *)weight_buf_a)
 #define SCRATCH_SIZE WEIGHT_BUF_SIZE
 
-// Token embedding read buffer: reads one Q4_0 row from wcls (tied embeddings)
-// Q4_0 row bytes = (D_MODEL / 32) * 18
-#define EMB_Q4_BYTES ((D_MODEL / 32) * 18)
+// Token embedding read buffer: reads one quantized row from wcls (tied embeddings)
+#define EMB_Q4_BYTES QUANT_ROW_BYTES(D_MODEL)
 #define EMB_BLOCKS (((EMB_Q4_BYTES + 511) / 512) + 1)
 static uint8_t emb_read_buf[EMB_BLOCKS * 512] __attribute__((aligned(4)));
 
@@ -126,9 +125,9 @@ static uint32_t scan_vocab_end(int vocab_size) {
     return pos;
 }
 
-// Q4_0 row size in bytes: (cols / 32) blocks × 18 bytes per block
+// Row size in bytes for the compile-time quant format (see quantize.h)
 static inline uint32_t q4_row_bytes(int cols) {
-    return (uint32_t)(cols / 32) * 18;
+    return (uint32_t)QUANT_ROW_BYTES(cols);
 }
 
 // Compute all byte offsets into the Q4_0 model file.
@@ -275,9 +274,12 @@ int main(void) {
     }
 
     // Switch to 250 MHz now that SD init is done at 200 MHz.
-    // SDIO driver auto-adjusts PIO divider (250/5 = 50 MHz HS).
+    // The SDIO divider was chosen at 200 MHz and is not recalculated,
+    // so the bus clock scales with sysclk.
     set_sys_clock_khz(250000, true);
     printf("System clock: 250 MHz\n");
+    printf("SDIO data clock: %lu kHz\n",
+           (unsigned long)(clock_get_hz(clk_sys) / sdcard_data_clk_divider() / 1000));
 
     // --- Initialize run state ---
     init_run_state(&ctx.state);

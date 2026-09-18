@@ -9,6 +9,7 @@ Usage:
     python tools/serial_chat.py                      # auto-detect port
     python tools/serial_chat.py --port /dev/cu.usbmodem1234
     python tools/serial_chat.py --model-name Qwen/Qwen3-0.6B
+    python tools/serial_chat.py --raw                # no chat template
 
 Requires: pip install pyserial transformers torch
 """
@@ -25,7 +26,10 @@ from transformers import AutoTokenizer
 
 def find_pico_port():
     """Auto-detect the Pico USB serial port."""
-    for port in serial.tools.list_ports.comports():
+    # The Raspberry Pi Debug Probe shares the Pico's USB vendor ID; skip it.
+    ports = [p for p in serial.tools.list_ports.comports()
+             if "cmsis-dap" not in (p.description or "").lower()]
+    for port in ports:
         desc = (port.description or "").lower()
         # Pico shows up as "Board in FS mode" or similar
         if "board in fs mode" in desc or "pico" in desc:
@@ -34,7 +38,7 @@ def find_pico_port():
         if port.vid == 0x2E8A:
             return port.device
     # Fallback: look for cu.usbmodem on macOS
-    for port in serial.tools.list_ports.comports():
+    for port in ports:
         if "usbmodem" in (port.device or ""):
             return port.device
     return None
@@ -60,8 +64,37 @@ def wait_for_prompt(ser, timeout=60):
     return False
 
 
-def send_and_receive(ser, token_ids, tokenizer):
-    """Send token IDs and decode the response in real-time."""
+# Firmware reads the prompt into a 512-byte buffer (src/main.c) and stops
+# reading at 511 characters, leaving the newline behind. Keep the
+# comma-separated token IDs to 510 characters so the newline is consumed.
+MAX_PAYLOAD_CHARS = 510
+
+
+def build_prompt_ids(tokenizer, text, raw=False, think=False):
+    """Tokenize a user prompt, wrapped in the model's chat template unless raw.
+
+    The firmware starts every prompt at position 0, so each prompt is a
+    single-turn conversation. Qwen3's hybrid models think by default, which
+    would use up the firmware's 64-token budget, so thinking is off unless
+    requested. Qwen3-4B-Thinking-2507's template always opens a <think> block.
+    """
+    if raw:
+        return tokenizer.encode(text, add_special_tokens=False)
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=think,
+    )
+    return tokenizer.encode(prompt, add_special_tokens=False)
+
+
+def send_and_receive(ser, token_ids, tokenizer, stop_ids=()):
+    """Send token IDs and decode the response in real-time.
+
+    Output after a stop token (end of turn) is not printed. The firmware has
+    no stop-token check, so it keeps generating until its token limit.
+    """
     # Send comma-separated token IDs
     payload = ",".join(str(t) for t in token_ids) + "\n"
     ser.write(payload.encode("ascii"))
@@ -70,6 +103,7 @@ def send_and_receive(ser, token_ids, tokenizer):
     buf = ""
     generated_tokens = []
     done = False
+    stopped = False
 
     while not done:
         if ser.in_waiting:
@@ -83,9 +117,14 @@ def send_and_receive(ser, token_ids, tokenizer):
                     break
                 token_id = int(m.group(1))
                 generated_tokens.append(token_id)
-                text = tokenizer.decode([token_id])
-                sys.stdout.write(text)
-                sys.stdout.flush()
+                if token_id in stop_ids and not stopped:
+                    stopped = True
+                    sys.stdout.write("\n  [end of turn; board keeps "
+                                     "generating until its token limit]")
+                    sys.stdout.flush()
+                elif not stopped:
+                    sys.stdout.write(tokenizer.decode([token_id]))
+                    sys.stdout.flush()
                 # Remove everything up to and including the match
                 buf = buf[m.end():]
 
@@ -120,12 +159,20 @@ def main():
                         help="HuggingFace model for tokenizer")
     parser.add_argument("--max-tokens", type=int, default=64,
                         help="Max tokens to generate (firmware default)")
+    parser.add_argument("--raw", action="store_true",
+                        help="Send the prompt as plain text, without the "
+                             "chat template")
+    parser.add_argument("--think", action="store_true",
+                        help="Enable thinking mode in the chat template")
     args = parser.parse_args()
 
     # Load tokenizer
     print(f"Loading tokenizer ({args.model_name})...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     print(f"  Vocab size: {tokenizer.vocab_size}")
+    print(f"  Prompt format: {'raw text' if args.raw else 'chat template'}"
+          + ("" if args.raw else f", thinking {'on' if args.think else 'off'}"))
+    stop_ids = () if args.raw else (tokenizer.convert_tokens_to_ids("<|im_end|>"),)
 
     # Find serial port
     port = args.port or find_pico_port()
@@ -169,12 +216,18 @@ def main():
                 continue
 
             # Tokenize
-            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            token_ids = build_prompt_ids(tokenizer, text, args.raw, args.think)
+            payload_len = len(",".join(str(t) for t in token_ids))
+            if payload_len > MAX_PAYLOAD_CHARS:
+                print(f"  Prompt too long: {len(token_ids)} tokens is "
+                      f"{payload_len} chars, firmware accepts "
+                      f"{MAX_PAYLOAD_CHARS}. Try a shorter prompt.")
+                continue
             print(f"  [{len(token_ids)} tokens: {token_ids}]")
             print("Bot: ", end="", flush=True)
 
             # Send and decode response
-            send_and_receive(ser, token_ids, tokenizer)
+            send_and_receive(ser, token_ids, tokenizer, stop_ids)
             print()
 
     except KeyboardInterrupt:

@@ -653,7 +653,7 @@
         "uuid": "ceb82f9c-82e6-470d-83eb-f5f0bf6dea80"
       }
     ],
-    "used_designators": "RESET1,RST1,#PWR21,SW1",
+    "used_designators": "",
     "variants": []
   },
   "sheets": [

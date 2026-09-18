@@ -38,6 +38,30 @@ void matmul_q1_0_g128_tile_dsp2(float *acc, const uint8_t *weights,
 // Convert IEEE 754 float16 (half-precision) to float32
 float fp16_to_fp32(uint16_t h);
 
+// ---------------------------------------------------------------------------
+// Compile-time quantization format selection.
+//
+// Both formats store 18 bytes per block; they differ only in how many weights
+// a block covers (32 for Q4_0, 128 for Q1_0_g128). Everything downstream --
+// row sizes, layout offsets, the embedding reader, the streaming matmul --
+// depends on the format only through these two macros, so one source tree
+// builds either model.
+//
+// Build with -DPICO_LLM_Q1 for Bonsai-1.7B (Q1_0_g128); default is Q4_0.
+// ---------------------------------------------------------------------------
+#ifdef PICO_LLM_Q1
+#define QUANT_WEIGHTS_PER_BLOCK 128
+#define QUANT_NAME              "Q1_0_g128"
+#define matmul_quant_tile       matmul_q1_0_g128_tile
+#else
+#define QUANT_WEIGHTS_PER_BLOCK 32
+#define QUANT_NAME              "Q4_0"
+#define matmul_quant_tile       matmul_q4_0_tile
+#endif
+
+// Row size in bytes: (cols / weights_per_block) blocks x 18 bytes per block.
+#define QUANT_ROW_BYTES(cols) (((cols) / QUANT_WEIGHTS_PER_BLOCK) * 18)
+
 #ifdef __cplusplus
 }
 #endif

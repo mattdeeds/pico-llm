@@ -37,6 +37,30 @@
 static uint32_t card_rca;    // Relative card address
 static uint32_t card_ocr;    // Operating condition register
 static bool card_sdhc;       // true = SDHC (sector addressing), false = byte addressing
+static int data_clk_divider; // sysclk / SDIO data clock, fixed at init
+
+#ifdef PICO_LLM_PROFILE
+// SD error/retry counters. Reset per token by Core 0.
+//
+// NOTE the asymmetry: sdcard_read_blocks() (init, KV cache) retries on CRC,
+// but the weight-stream prefetch path (weightbuf_start_prefetch/_get) does
+// NOT -- it only logs and carries on. So blk_retries covers KV traffic while
+// pf_cmd_fail/pf_rx_fail/pf_dma_err cover the weight stream. If the 62.5 MHz
+// overclock is tripping CRC, these are where it shows up.
+sd_counters_t g_sd;
+
+// Split of weightbuf time: per-buffer command overhead vs actual data transfer.
+// cmd18_us + stop_us is the fixed cost paid once per 32 KB buffer; data_us is
+// the part that scales with bus clock. If overhead dominates, a faster bus
+// clock cannot help and the fix is fewer, longer CMD18 runs.
+uint64_t g_pf_cmd18_us;  // CMD18 issue (start of each prefetch)
+uint64_t g_pf_data_us;   // polling DMA until blocks land
+uint64_t g_pf_stop_us;   // CMD12 + rp2350_sdio_stop() teardown
+uint32_t g_pf_buffers;   // number of prefetch buffers issued
+#define SD_COUNT(field) (g_sd.field++)
+#else
+#define SD_COUNT(field) ((void)0)
+#endif
 
 static sdio_status_t sd_cmd(uint8_t cmd, uint32_t arg, uint32_t *resp) {
     return rp2350_sdio_command_u32(cmd, arg, resp, 0);
@@ -176,6 +200,22 @@ bool sdcard_init(void) {
     }
 
     rp2350_sdio_timing_t hs_timing = rp2350_sdio_get_timing(speed_mode);
+
+    // Optional divider override (build with -DSDIO_DATA_CLK_DIVIDER=5).
+    //
+    // The divider is chosen here at 200 MHz sysclk and is NOT recalculated when
+    // main() switches to 250 MHz, so the final bus clock is 250 / divider:
+    //   divider 4 -> 62.5 MHz  (default; 25% past the 50 MHz high-speed spec)
+    //   divider 5 -> 50.0 MHz  (in spec; what docs/draft.md measured at 15.5 s/tok)
+    // Set this to 5 to A/B the overclock against a spec-compliant bus.
+#ifdef SDIO_DATA_CLK_DIVIDER
+    if (hs_timing.use_high_speed) {
+        hs_timing.data_clk_divider = SDIO_DATA_CLK_DIVIDER;
+        printf("SDIO: data clock divider overridden to %d\n",
+               SDIO_DATA_CLK_DIVIDER);
+    }
+#endif
+
     rp2350_sdio_init(hs_timing);
 
     // Set block length to 512 for data transfers
@@ -195,12 +235,17 @@ bool sdcard_init(void) {
         }
     }
 
+    data_clk_divider = hs_timing.data_clk_divider;
     uint32_t actual_khz = clock_get_hz(clk_sys) / hs_timing.data_clk_divider / 1000;
     printf("SDIO init OK (%s, %s, actual = %lu kHz)\n",
            card_sdhc ? "SDHC" : "SD",
            hs_timing.use_high_speed ? "high-speed 50MHz" : "standard 25MHz",
            (unsigned long)actual_khz);
     return true;
+}
+
+int sdcard_data_clk_divider(void) {
+    return data_clk_divider;
 }
 
 bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count) {
@@ -229,6 +274,7 @@ bool sdcard_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count) {
     // Multi-block read with retries
     for (int retry = 0; retry < 3; retry++) {
         if (retry > 0) {
+            SD_COUNT(blk_retries);
             rp2350_sdio_stop();
             busy_wait_us_32(1000);
         }
@@ -341,9 +387,15 @@ void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t s
     uint32_t address = card_sdhc ? block : (block * 512);
     uint32_t reply;
 
+#ifdef PICO_LLM_PROFILE
+    uint64_t t0 = time_us_64();
+    g_pf_buffers++;
+#endif
+
     sdio_status_t status = rp2350_sdio_command_u32(CMD18, address, &reply,
                                                     SDIO_FLAG_STOP_CLK);
     if (status != SDIO_OK) {
+        SD_COUNT(pf_cmd_fail);
         printf("prefetch CMD18 fail at block %lu (status=%d)\n",
                (unsigned long)block, status);
         wb->dma_pending = false;
@@ -352,12 +404,17 @@ void weightbuf_start_prefetch(WeightBuf *wb, uint32_t sd_byte_offset, uint32_t s
 
     status = rp2350_sdio_rx_start((uint8_t *)wb->prefetch, block_count, 512);
     if (status != SDIO_OK) {
+        SD_COUNT(pf_rx_fail);
         printf("prefetch rx_start fail (status=%d)\n", status);
         rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
         rp2350_sdio_stop();
         wb->dma_pending = false;
         return;
     }
+
+#ifdef PICO_LLM_PROFILE
+    g_pf_cmd18_us += time_us_64() - t0;
+#endif
 
     wb->dma_pending = true;
 }
@@ -366,17 +423,28 @@ int8_t *weightbuf_get(WeightBuf *wb) {
     if (wb->dma_pending) {
         // Poll until async DMA completes
         sdio_status_t status;
+#ifdef PICO_LLM_PROFILE
+        uint64_t t0 = time_us_64();
+#endif
         do {
             rp2350_sdio_poll_dma();
             status = rp2350_sdio_rx_poll(NULL);
         } while (status == SDIO_BUSY);
+#ifdef PICO_LLM_PROFILE
+        uint64_t t1 = time_us_64();
+        g_pf_data_us += t1 - t0;
+#endif
 
         uint32_t reply;
         rp2350_sdio_command_u32(CMD12, 0, &reply, 0);
         rp2350_sdio_stop();
         wb->dma_pending = false;
+#ifdef PICO_LLM_PROFILE
+        g_pf_stop_us += time_us_64() - t1;
+#endif
 
         if (status != SDIO_OK) {
+            SD_COUNT(pf_dma_err);
             printf("weightbuf_get: DMA error %d\n", status);
         }
     }
@@ -407,16 +475,26 @@ typedef struct {
 
 ComputeState g_compute;
 
+#ifdef PICO_LLM_PROFILE
+uint64_t g_core1_busy_us;
+#endif
+
 void compute_worker(void) {
     while (1) {
         uint32_t weights_ptr = multicore_fifo_pop_blocking();
         uint32_t n_rows = multicore_fifo_pop_blocking();
+#ifdef PICO_LLM_PROFILE
+        uint64_t t0 = time_us_64();
+#endif
 
-        matmul_q4_0_tile(g_compute.acc + g_compute.rows_done,
-                         (const uint8_t *)weights_ptr,
-                         g_compute.x_q, (int)n_rows, g_compute.cols);
+        matmul_quant_tile(g_compute.acc + g_compute.rows_done,
+                          (const uint8_t *)weights_ptr,
+                          g_compute.x_q, (int)n_rows, g_compute.cols);
         g_compute.rows_done += (int)n_rows;
 
+#ifdef PICO_LLM_PROFILE
+        g_core1_busy_us += time_us_64() - t0;
+#endif
         multicore_fifo_push_blocking(1);
     }
 }

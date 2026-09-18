@@ -21,8 +21,102 @@ extern ComputeState g_compute;
 // Shared matmul accumulator (defined in main.c)
 extern float matmul_acc[];
 
-// Q4_0 row size in bytes: (cols / 32) blocks × 18 bytes per block
-#define Q4_ROW_BYTES(cols) (((cols) / 32) * 18)
+// ============================================================================
+// Per-token profiling (build with -DPICO_LLM_PROFILE=ON)
+//
+// Times are measured on Core 0, except core1_busy (time Core 1 spends in the
+// matmul kernel). Waits on Core 1 and waits on SD buffers overlap with work
+// on the other core, so they show which side the pipeline is waiting on.
+// ============================================================================
+
+#ifdef PICO_LLM_PROFILE
+static struct {
+    uint64_t io_wait;    // waiting for an SD buffer to finish (incl. CMD12)
+    uint64_t io_cmd;     // starting SD reads (CMD18), Core 1 idle meanwhile
+    uint64_t c1_wait;    // waiting for Core 1 to finish a tile
+    uint64_t c0_matmul;  // boundary-spanning rows computed on Core 0
+    uint64_t kv_write;   // KV cache writes, incl. card busy wait
+    uint64_t attention;  // KV cache reads + attention math
+    uint64_t sample;     // whole classifier pass (overlaps the waits above)
+} prof;
+
+#define PROF_BEGIN() uint64_t prof_t0 = time_us_64()
+#define PROF_END(field) (prof.field += time_us_64() - prof_t0)
+
+static unsigned long prof_ms(uint64_t us) { return (unsigned long)(us / 1000); }
+
+static void prof_report(int pos, int64_t total_ms) {
+    printf("{pos=%d total=%lld io_wait=%lu io_cmd=%lu c1_wait=%lu "
+           "core1_busy=%lu c0_matmul=%lu kv_write=%lu attention=%lu "
+           "sample=%lu ms} ",
+           pos, (long long)total_ms, prof_ms(prof.io_wait),
+           prof_ms(prof.io_cmd), prof_ms(prof.c1_wait),
+           prof_ms(g_core1_busy_us), prof_ms(prof.c0_matmul),
+           prof_ms(prof.kv_write), prof_ms(prof.attention),
+           prof_ms(prof.sample));
+
+    // Weight-stream breakdown. Total SD read time is NOT io_wait -- io_wait is
+    // only the part compute failed to hide. The real figure is the sum below,
+    // and per_buf_us shows whether the fixed per-buffer command cost or the
+    // bus-clock-dependent data transfer dominates.
+    uint64_t pf_total = g_pf_cmd18_us + g_pf_data_us + g_pf_stop_us;
+    printf("{sd bufs=%lu cmd18=%lu data=%lu stop=%lu total=%lu ms "
+           "per_buf=%lu us} ",
+           (unsigned long)g_pf_buffers, prof_ms(g_pf_cmd18_us),
+           prof_ms(g_pf_data_us), prof_ms(g_pf_stop_us), prof_ms(pf_total),
+           (unsigned long)(g_pf_buffers ? pf_total / g_pf_buffers : 0));
+
+    // Any non-zero value here means the bus is retrying or erroring.
+    if (g_sd.blk_retries | g_sd.pf_cmd_fail | g_sd.pf_rx_fail | g_sd.pf_dma_err) {
+        printf("{SD ERRORS blk_retries=%lu cmd_fail=%lu rx_fail=%lu dma_err=%lu} ",
+               (unsigned long)g_sd.blk_retries, (unsigned long)g_sd.pf_cmd_fail,
+               (unsigned long)g_sd.pf_rx_fail, (unsigned long)g_sd.pf_dma_err);
+    }
+
+    memset(&prof, 0, sizeof(prof));
+    g_core1_busy_us = 0;
+    memset(&g_sd, 0, sizeof(g_sd));
+    g_pf_cmd18_us = g_pf_data_us = g_pf_stop_us = 0;
+    g_pf_buffers = 0;
+}
+#else
+#define PROF_BEGIN()
+#define PROF_END(field)
+static inline void prof_report(int pos, int64_t total_ms) {
+    (void)pos;
+    (void)total_ms;
+}
+#endif
+
+static inline void start_buffer(struct WeightBuf *wb, uint32_t sd_byte_offset,
+                                uint32_t size) {
+    PROF_BEGIN();
+    weightbuf_start_prefetch(wb, sd_byte_offset, size);
+    PROF_END(io_cmd);
+}
+
+static inline int8_t *wait_buffer(struct WeightBuf *wb) {
+    PROF_BEGIN();
+    int8_t *buf = weightbuf_get(wb);
+    PROF_END(io_wait);
+    return buf;
+}
+
+static inline void wait_core1(void) {
+    PROF_BEGIN();
+    multicore_fifo_pop_blocking();
+    PROF_END(c1_wait);
+}
+
+static inline void core0_matmul(float *acc, const uint8_t *weights,
+                                const int8_t *x_q, int tile_rows, int cols) {
+    PROF_BEGIN();
+    matmul_quant_tile(acc, weights, x_q, tile_rows, cols);
+    PROF_END(c0_matmul);
+}
+
+// Row size comes from the compile-time quant format (see quantize.h).
+#define Q4_ROW_BYTES(cols) QUANT_ROW_BYTES(cols)
 
 // Max Q4_0 row bytes for any matmul (for row_tmp VLA)
 #define MAX_Q4_ROW_BYTES (Q4_ROW_BYTES(HIDDEN_DIM > Q_DIM ? HIDDEN_DIM : Q_DIM))
@@ -170,7 +264,7 @@ void ws_init(WeightStream *ws, struct WeightBuf *wb, uint32_t sd_byte_offset,
     // Kick off first prefetch
     uint32_t first_size = total_bytes;
     if (first_size > wb->buf_size) first_size = wb->buf_size;
-    weightbuf_start_prefetch(wb, sd_byte_offset, first_size);
+    start_buffer(wb, sd_byte_offset, first_size);
     ws->prefetch_pending = true;
 }
 
@@ -182,7 +276,7 @@ void ws_ensure(WeightStream *ws, uint32_t min_bytes) {
         return; // no more data
 
     // Wait for the prefetched buffer
-    ws->buf_ptr = weightbuf_get(ws->wb);
+    ws->buf_ptr = wait_buffer(ws->wb);
     ws->prefetch_pending = false;
 
     // Data starts at sub-block offset within the buffer
@@ -200,7 +294,7 @@ void ws_ensure(WeightStream *ws, uint32_t min_bytes) {
     if (next_sd_off < ws->end_sd_off) {
         uint32_t next_size = ws->end_sd_off - next_sd_off;
         if (next_size > ws->wb->buf_size) next_size = ws->wb->buf_size;
-        weightbuf_start_prefetch(ws->wb, next_sd_off, next_size);
+        start_buffer(ws->wb, next_sd_off, next_size);
         ws->prefetch_pending = true;
     }
 }
@@ -221,7 +315,7 @@ void ws_read_bytes(WeightStream *ws, void *out, uint32_t nbytes) {
 
 void ws_drain(WeightStream *ws) {
     if (ws->prefetch_pending) {
-        weightbuf_get(ws->wb);
+        wait_buffer(ws->wb);
         ws->prefetch_pending = false;
     }
 
@@ -234,8 +328,8 @@ void ws_drain(WeightStream *ws) {
     }
 
     uint32_t size = remaining < ws->wb->buf_size ? remaining : ws->wb->buf_size;
-    weightbuf_start_prefetch(ws->wb, ws->sd_off, size);
-    ws->buf_ptr = weightbuf_get(ws->wb);
+    start_buffer(ws->wb, ws->sd_off, size);
+    ws->buf_ptr = wait_buffer(ws->wb);
 
     uint32_t skip = ws->sd_off % 512;
     ws->buf_off = skip;
@@ -250,7 +344,7 @@ void ws_resume(WeightStream *ws) {
     if (next_sd_off < ws->end_sd_off) {
         uint32_t next_size = ws->end_sd_off - next_sd_off;
         if (next_size > ws->wb->buf_size) next_size = ws->wb->buf_size;
-        weightbuf_start_prefetch(ws->wb, next_sd_off, next_size);
+        start_buffer(ws->wb, next_sd_off, next_size);
         ws->prefetch_pending = true;
     }
 }
@@ -275,7 +369,7 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
 
     while (rows_sent < rows) {
         if (core1_busy) {
-            multicore_fifo_pop_blocking();
+            wait_core1();
             core1_busy = false;
         }
 
@@ -295,15 +389,15 @@ void ws_tiled_matmul(WeightStream *ws, float *out, const int8_t *x_q,
         } else {
             // Row spans buffer boundary — read into temp and process on Core 0
             ws_read_bytes(ws, row_tmp, row_bytes);
-            matmul_q4_0_tile(matmul_acc + g_compute.rows_done,
-                             row_tmp, x_q, 1, cols);
+            core0_matmul(matmul_acc + g_compute.rows_done,
+                         row_tmp, x_q, 1, cols);
             g_compute.rows_done++;
             rows_sent++;
         }
     }
 
     if (core1_busy) {
-        multicore_fifo_pop_blocking();
+        wait_core1();
     }
 
     // Q4_0 matmul output is already dequantized per-block — just apply x_scale
@@ -372,7 +466,7 @@ int ws_sample_token(WeightStream *ws, const int8_t *x_q,
 
         while (chunk_sent < chunk) {
             if (core1_busy) {
-                multicore_fifo_pop_blocking();
+                wait_core1();
                 core1_busy = false;
             }
 
@@ -391,15 +485,15 @@ int ws_sample_token(WeightStream *ws, const int8_t *x_q,
                 chunk_sent += tile;
             } else {
                 ws_read_bytes(ws, row_tmp, row_bytes);
-                matmul_q4_0_tile(matmul_acc + g_compute.rows_done,
-                                 row_tmp, x_q, 1, cols);
+                core0_matmul(matmul_acc + g_compute.rows_done,
+                             row_tmp, x_q, 1, cols);
                 g_compute.rows_done++;
                 chunk_sent++;
             }
         }
 
         if (core1_busy) {
-            multicore_fifo_pop_blocking();
+            wait_core1();
         }
 
         // Score each token in this chunk
@@ -573,10 +667,18 @@ int forward(TransformerContext *ctx, int token, int pos) {
         ws_drain(&ws);
 
         // Write K, V to SD KV cache
-        kv_cache_write(ctx, l, pos, s->k, s->v);
+        {
+            PROF_BEGIN();
+            kv_cache_write(ctx, l, pos, s->k, s->v);
+            PROF_END(kv_write);
+        }
 
         // Online attention over SD KV cache → output in s->xb [Q_DIM]
-        attention_sd(ctx, l, pos, s->q, s->xb);
+        {
+            PROF_BEGIN();
+            attention_sd(ctx, l, pos, s->q, s->xb);
+            PROF_END(attention);
+        }
 
         // === Phase 3: Post-attention weights (streamed) ===
 
@@ -631,10 +733,12 @@ int forward(TransformerContext *ctx, int token, int pos) {
 
     int8_t x_q[D_MODEL];
     float x_scale = quantize_vec(x_q, s->x, dim);
+    PROF_BEGIN();
     int next_token = ws_sample_token(
         &ws, x_q, x_scale, cfg->vocab_size, dim,
         ctx->temperature, ctx->repetition_penalty,
         s->recent_tokens, s->recent_count, &s->rng_state);
+    PROF_END(sample);
     ws_drain(&ws);
 
     s->kv_cache_len = pos + 1;
@@ -664,6 +768,7 @@ int generate(TransformerContext *ctx, const Tokenizer *tok,
             printf("[forward failed at pos %d]\n", pos);
             break;
         }
+        prof_report(pos, tok_ms);
 
         if (pos < n_prompt - 1) {
             token = prompt_tokens[pos + 1];
