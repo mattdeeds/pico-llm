@@ -1,6 +1,6 @@
 # pico-llm
 
-Transformer LLM inference on a the RP2350.
+Transformer LLM inference on the RP2350.
 
 **Write-up:** [From 9M to 4B Parameters on a $1 Microcontroller](https://mattdeeds.com/writing/pico-llm.html)
 
